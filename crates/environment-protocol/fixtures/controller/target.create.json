@@ -1,0 +1,33 @@
+{
+  "params": {
+    "owner": {
+      "universeId": "u1",
+      "environmentId": "env_1"
+    },
+    "templateId": "ubuntu-24.04-small",
+    "displayName": "build box",
+    "idle": {
+      "pauseAfterMs": 600000,
+      "stopAfterMs": 3600000
+    }
+  },
+  "response": {
+    "target": {
+      "targetId": "ls-3f2a",
+      "owner": {
+        "universeId": "u1",
+        "environmentId": "env_1"
+      },
+      "phase": "provisioning",
+      "message": "pulling image"
+    }
+  },
+  "error": {
+    "code": -32007,
+    "message": "template ubuntu-24.04-small is deprecated",
+    "data": {
+      "kind": "failedPrecondition",
+      "reason": "templateDeprecated"
+    }
+  }
+}

@@ -1,13 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
-use environment_client::{EnvironmentClientError, EnvironmentDataClient, WebSocketConnectOptions};
+use environment_client::{ClientError, DataClient};
 use environment_protocol::{
-    data::{
-        handshake::{InitializeParams, InitializedParams},
-        jobs::{JobReadResult as ProtocolJobReadResult, ReadJobsParams},
-    },
-    shared::{CURRENT_PROTOCOL_VERSION, EnvironmentDataConnection, EnvironmentTransport},
+    data::fs::{FileKind, GetMetadataParams},
+    paths::EnvironmentPath,
 };
 use environments::{EnvironmentId, EnvironmentRecord, EnvironmentRegistryError, EnvironmentStore};
 use harness::PromiseIdAllocator;
@@ -32,10 +29,10 @@ use tools::{
         is_environment_selection_tool,
     },
     environment::jobs::{
-        JOB_RUN_WORKFLOW_SEMANTIC_TYPE, JOB_RUN_WORKFLOW_TOOL_ID,
+        DEFAULT_JOB_OUTPUT_BYTES, JOB_RUN_WORKFLOW_SEMANTIC_TYPE, JOB_RUN_WORKFLOW_TOOL_ID,
         JOB_SUBMIT_WORKFLOW_SEMANTIC_TYPE, JOB_SUBMIT_WORKFLOW_TOOL_ID, JobHandle, JobHandleArg,
         JobReadArgs, JobSubmitExecutionContextV1, ModelJobResult, ModelJobResultSet,
-        NormalizeJobResultInput, normalize_job_result,
+        NormalizeJobResultInput, job_output_read, model_job_error, normalize_job_result,
     },
     environment_protocol::RemoteEnvironmentConnection,
     fs::{AttachedVfsFileSystem, FsPath, FsToolContext},
@@ -417,8 +414,7 @@ impl SessionTools {
                         environments,
                         args.jobs,
                         args.output_bytes,
-                        args.after_seq,
-                        args.include_artifacts,
+                        args.after,
                     )
                     .await?;
                 self.succeeded_job_read_result(call, result.entries).await
@@ -442,10 +438,12 @@ impl SessionTools {
         policy: Option<&harness::EnvironmentsFeature>,
         environments: &SessionEnvironmentManager,
         handles: Vec<JobHandleArg>,
-        output_bytes: Option<usize>,
-        after_seq: Option<u64>,
-        include_artifacts: bool,
+        output_bytes: Option<u64>,
+        after: Option<u64>,
     ) -> Result<EnvironmentJobRead, CoreAgentIoError> {
+        let output_bytes = output_bytes
+            .unwrap_or(DEFAULT_JOB_OUTPUT_BYTES)
+            .min(ToolLimits::default().max_model_visible_output_bytes);
         let mut entries = Vec::with_capacity(handles.len());
         for handle in handles {
             let resolved = match resolve_job_handle_arg(active_environment_id, policy, handle) {
@@ -478,6 +476,28 @@ impl SessionTools {
                 environments.environment(environment_id.as_str()).cloned()
             {
                 (Ok(environment), false)
+            } else if let Some(resolver) = self.environment_resolver.as_ref() {
+                // The single use gate, as for the active environment.
+                let resource = match now_unix_ms().and_then(|now| {
+                    i64::try_from(now)
+                        .map_err(|_| io_error("current timestamp does not fit in i64"))
+                }) {
+                    Ok(now) => resolver
+                        .resolve_for_connection(&environment_id, now)
+                        .await
+                        .map_err(RuntimeEnvironmentError::Refused),
+                    Err(error) => Err(error.into()),
+                };
+                (
+                    match resource {
+                        Ok(resource) => {
+                            self.runtime_environment_for_resource(session_id, resource, None)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    },
+                    true,
+                )
             } else if let Some(store) = self.environment_store.as_ref() {
                 (
                     match store.read_environment(&environment_id).await {
@@ -485,15 +505,13 @@ impl SessionTools {
                             self.runtime_environment_for_resource(session_id, resource, None)
                                 .await
                         }
-                        Err(error) => Err(map_environments_error(error)),
+                        Err(error) => Err(map_environments_error(error).into()),
                     },
                     true,
                 )
             } else {
                 (
-                    Err(io_error(
-                        "environment store is not configured on this runtime",
-                    )),
+                    Err(io_error("environment store is not configured on this runtime").into()),
                     false,
                 )
             };
@@ -517,26 +535,26 @@ impl SessionTools {
                 }
                 continue;
             };
+            // The head and the tail of the output, or a page from `after`,
+            // within the daemon's read ceiling.
+            let budget = jobs.limits().map_or(output_bytes, |limits| {
+                output_bytes.min(limits.max_read_bytes)
+            });
             match jobs
-                .read_jobs(ReadJobsParams {
-                    namespace: environment_id.as_str().to_owned(),
-                    jobs: vec![resolved.job_id.clone()],
-                    after_seq,
-                    max_bytes: output_bytes,
-                    include_artifacts,
-                    wait_ms: None,
-                })
+                .read_jobs(job_output_read(
+                    std::slice::from_ref(&resolved.job_id),
+                    after,
+                    budget,
+                ))
                 .await
             {
                 Ok(response) => {
+                    let input =
+                        NormalizeJobResultInput::from_entries(Some(resolved), response.jobs);
                     entries.push(
-                        job_read_entry_from_response(
-                            self.blobs.as_ref(),
-                            resolved,
-                            response.jobs.into_iter().next(),
-                            output_bytes,
-                        )
-                        .await?,
+                        normalize_job_result(self.blobs.as_ref(), input)
+                            .await
+                            .map_err(map_blob_error)?,
                     );
                 }
                 Err(error) => {
@@ -1069,14 +1087,7 @@ impl SessionTools {
                         .await;
                     }
                 };
-                let mut output =
-                    environment_model_view(attachment, Some(&environment), active, policy);
-                if crate::environments::resolver::wake_on_use_applies(&environment) {
-                    output.status_message = Some(format!(
-                        "Environment is {}. Tools that use this environment will automatically wake it and wait until it is ready. You can proceed normally.",
-                        format!("{:?}", environment.status).to_lowercase(),
-                    ));
-                }
+                let output = environment_model_view(attachment, Some(&environment), active, policy);
                 self.succeeded_tool_result(
                     call,
                     &output,
@@ -1117,7 +1128,8 @@ impl SessionTools {
                         .await;
                     }
                 };
-                let ready = environment.status == environments::EnvironmentStatus::Ready;
+                let status = environment.display_status();
+                let ready = status == environments::EnvironmentDisplayStatus::Ready;
                 let reference = tools::environment::handles::environment_reference(
                     environment.environment_id.as_str(),
                     policy
@@ -1129,7 +1141,7 @@ impl SessionTools {
                     environment_id: reference.clone(),
                     active: true,
                     ready,
-                    status: format!("{:?}", environment.status).to_lowercase(),
+                    status: status.as_str().to_owned(),
                     access: attachment.access.describe().to_owned(),
                     working_directory: attachment.working_directory.clone(),
                 };
@@ -1144,7 +1156,7 @@ impl SessionTools {
                         "Active environment set to {} (access: {}; currently {}; availability is checked when an environment tool uses it).",
                         reference,
                         attachment.access.describe(),
-                        format!("{:?}", environment.status).to_lowercase()
+                        status
                     )
                 };
                 let mut result = self.succeeded_tool_result(call, &output, summary).await?;
@@ -1219,12 +1231,13 @@ impl SessionTools {
                 )) => return Err(io_error(message)),
                 Err(crate::environments::resolver::EnvironmentResolveError::NotReady {
                     environment_id,
-                    status,
+                    reason,
+                    ..
                 }) => {
                     return Ok(environments.with_active_blocker(
                         ActiveEnvironmentBlocker::NotReady {
                             environment_id,
-                            status,
+                            reason,
                         },
                     ));
                 }
@@ -1254,13 +1267,7 @@ impl SessionTools {
             .await
         {
             Ok(environment) => environment,
-            Err(error) => {
-                return Ok(environments.with_active_blocker(
-                    ActiveEnvironmentBlocker::Unavailable {
-                        message: error.to_string(),
-                    },
-                ));
-            }
+            Err(error) => return Ok(environments.with_active_blocker(error.into_blocker())),
         };
         environments.insert_environment(environment);
         Ok(environments)
@@ -1271,71 +1278,38 @@ impl SessionTools {
         session_id: &SessionId,
         resource: EnvironmentRecord,
         working_directory: Option<&str>,
-    ) -> Result<RuntimeEnvironment, CoreAgentIoError> {
+    ) -> Result<RuntimeEnvironment, RuntimeEnvironmentError> {
         let gateway = self
             .environment_gateway
             .as_ref()
             .ok_or_else(|| io_error("environment gateway is not configured on this worker"))?;
-        let connection = gateway.connection_for(
+        let endpoint = gateway.endpoint_for(
             self.environment_resolver
                 .as_ref()
                 .map(|resolver| resolver.universe_id())
                 .unwrap_or_default(),
             &resource,
         );
-        let mut client = connect_environment_data_client(
-            &connection,
+        let (client, _) = DataClient::connect_initialized(
+            &endpoint,
             gateway.connect_options("lightspeed-temporal-runtime"),
         )
-        .await?;
-        let response = client
-            .initialize(&InitializeParams {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                client_name: "lightspeed-temporal-runtime".to_owned(),
-                scope: connection.scope.clone(),
-                resume_connection_id: None,
-            })
-            .await
-            .map_err(map_environment_client_error)?;
-        if response.protocol_version != CURRENT_PROTOCOL_VERSION {
-            return Err(io_error(format!(
-                "unsupported environment data protocol version {}; expected {CURRENT_PROTOCOL_VERSION}",
-                response.protocol_version
-            )));
-        }
-        client
-            .initialized(&InitializedParams {})
-            .await
-            .map_err(map_environment_client_error)?;
-        let cwd = if response.capabilities.filesystem_read {
-            match crate::environments::sources::working_directory(
-                &mut client,
-                working_directory,
-                response.default_cwd.as_deref(),
-            )
-            .await
-            {
-                Ok(cwd) => cwd,
-                Err(error) => {
-                    let _ = client.close().await;
-                    return Err(io_error(error));
-                }
+        .await
+        .map_err(|error| {
+            match crate::environments::resolver::route_refusal_error(&resource, &error) {
+                Some(refusal) => RuntimeEnvironmentError::Refused(refusal),
+                None => map_environment_client_error(error).into(),
             }
-        } else {
-            let cwd = working_directory
-                .or(response.default_cwd.as_deref())
-                .ok_or_else(|| io_error("environment has no working directory"))?;
-            tools::environment::sources::absolute(std::path::Path::new("/"), cwd)
-                .map_err(io_error)?
-                .to_string_lossy()
-                .into_owned()
+        })?;
+        let cwd = match environment_working_directory(&client, working_directory).await {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                let _ = client.close().await;
+                return Err(io_error(error).into());
+            }
         };
-        let cwd = Some(FsPath::new(cwd).map_err(io_error)?);
-
-        let mut remote_connection = RemoteEnvironmentConnection::new(client, response.capabilities);
-        if let Some(cwd) = cwd {
-            remote_connection = remote_connection.with_cwd(cwd);
-        }
+        let remote_connection = RemoteEnvironmentConnection::new(client)
+            .with_cwd(FsPath::new(cwd.as_str()).map_err(io_error)?);
         let (_fs_context, mut environment_context) =
             remote_connection.clone().into_contexts(self.blobs.clone());
         if let Some(credentials) = &self.environment_credentials {
@@ -1454,16 +1428,36 @@ fn environment_model_view(
                 .iter()
                 .map(|attachment| attachment.environment_id.as_str()),
         ),
-        provider_id: environment
-            .and_then(|environment| environment.provider_id().map(|id| id.as_str().to_owned())),
         display_name: environment.and_then(|environment| environment.display_name.clone()),
-        status: environment.map(|environment| format!("{:?}", environment.status).to_lowercase()),
+        status: environment.map(|environment| environment.display_status().as_str().to_owned()),
         access: attachment.access.describe().to_owned(),
         default: attachment.default,
         working_directory: attachment.working_directory.clone(),
         active: active.is_some_and(|active| active.as_str() == attachment.environment_id),
-        observed_at_ms: environment.map(|environment| environment.observed_at_ms()),
-        status_message: None,
+        status_message: environment.and_then(environment_status_message),
+    }
+}
+
+/// What the model should know about an environment that is not ready: a
+/// powered-down target wakes when a tool uses it, a disconnected daemon may
+/// come back, and a failed environment says why.
+fn environment_status_message(environment: &EnvironmentRecord) -> Option<String> {
+    use environments::EnvironmentDisplayStatus as Status;
+    match environment.display_status() {
+        status @ (Status::Paused | Status::Suspended | Status::Stopped) => Some(format!(
+            "Environment is {status}. Tools that use it wake it and wait until it is ready."
+        )),
+        Status::Away => Some(
+            match environment.registered().map(|source| source.identity_mode) {
+                Some(environments::RegisteredIdentityMode::Persistent) => {
+                    "The daemon is disconnected; tools wait up to two minutes for it to reconnect."
+                }
+                _ => "The daemon is disconnected.",
+            }
+            .to_owned(),
+        ),
+        Status::Failed => environment.state_message.clone(),
+        _ => None,
     }
 }
 
@@ -1571,73 +1565,46 @@ fn supplied_environment_policy(
         .ok_or_else(|| io_error("environment grant is missing from the batch request"))
 }
 
-async fn job_read_entry_from_response(
-    blobs: &dyn BlobStore,
-    handle: JobHandle,
-    response: Option<ProtocolJobReadResult>,
-    output_bytes: Option<usize>,
-) -> Result<ModelJobResult, CoreAgentIoError> {
-    match response {
-        Some(response) => normalize_job_result(
-            blobs,
-            NormalizeJobResultInput {
-                handle: Some(handle),
-                summary: Some(response.summary),
-                output_chunks: response.output_chunks,
-                output_next_seq: response.output_next_seq,
-                artifacts: response.artifacts,
-                output_bytes,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(map_blob_error),
-        None => Ok(model_job_error(
-            Some(handle),
-            "provider returned no job result".to_owned(),
-        )),
-    }
-}
-
-fn model_job_error(handle: Option<JobHandle>, error: String) -> ModelJobResult {
-    ModelJobResult {
-        handle: handle.map(|mut handle| {
-            handle.environment_id =
-                tools::environment::handles::environment_handle(&handle.environment_id);
-            handle
-        }),
-        summary: None,
-        output: Vec::new(),
-        output_next_seq: 0,
-        truncated: false,
-        artifacts: Vec::new(),
-        error: Some(error),
-    }
-}
-
-async fn connect_environment_data_client(
-    connection: &EnvironmentDataConnection,
-    options: WebSocketConnectOptions,
-) -> Result<EnvironmentDataClient<environment_client::WebSocketTransport>, CoreAgentIoError> {
-    match &connection.transport {
-        EnvironmentTransport::WebSocket => {
-            EnvironmentDataClient::connect(&connection.endpoint, options)
-                .await
-                .map_err(map_environment_client_error)
+/// The session's working directory in the environment: the attachment's
+/// configured one, else the daemon's `defaultCwd`. It must be a directory,
+/// a symlink to one inside the fs root included; a daemon without the
+/// filesystem family cannot be asked, so its directory is taken as given.
+async fn environment_working_directory(
+    client: &DataClient,
+    configured: Option<&str>,
+) -> Result<EnvironmentPath, String> {
+    let initialized = client.initialize_response();
+    let cwd = match configured {
+        Some(value) => {
+            if !value.starts_with('/') {
+                return Err(format!(
+                    "environment working directory must be absolute: {value}"
+                ));
+            }
+            let normalized =
+                tools::environment::sources::absolute(std::path::Path::new("/"), value)?;
+            EnvironmentPath::new(normalized.to_string_lossy())
+                .map_err(|error| format!("environment working directory {value}: {error}"))?
         }
-        EnvironmentTransport::Http => Err(unsupported_environment_data_transport("http")),
-        EnvironmentTransport::Stdio => Err(unsupported_environment_data_transport("stdio")),
-        EnvironmentTransport::Ssh => Err(unsupported_environment_data_transport("ssh")),
-        EnvironmentTransport::Provider { provider_type } => Err(
-            unsupported_environment_data_transport(format!("provider:{provider_type}")),
-        ),
+        None => initialized.default_cwd.clone(),
+    };
+    if initialized.capabilities.filesystem.is_none() {
+        return Ok(cwd);
     }
-}
-
-fn unsupported_environment_data_transport(transport: impl std::fmt::Display) -> CoreAgentIoError {
-    io_error(format!(
-        "environment data transport is not supported by this worker: {transport}"
-    ))
+    let response = client
+        .get_metadata(&GetMetadataParams {
+            path: cwd.clone(),
+            follow_symlinks: true,
+        })
+        .await
+        .map_err(|error| format!("working directory {}: {error}", cwd.as_str()))?;
+    if response.metadata.kind != FileKind::Directory {
+        return Err(format!(
+            "working directory is not a directory: {}",
+            cwd.as_str()
+        ));
+    }
+    Ok(cwd)
 }
 
 #[derive(Clone, Copy)]
@@ -1871,14 +1838,14 @@ impl CoreAgentTools for SessionTools {
             ToolCallExecution::EnvironmentNotReady {
                 call_id,
                 environment_id,
-                status,
+                reason,
             } => {
                 failed_result(
                     self.blobs.as_ref(),
                     call_id,
                     active_environment_blocker_message(&ActiveEnvironmentBlocker::NotReady {
                         environment_id,
-                        status,
+                        reason,
                     }),
                 )
                 .await
@@ -1892,12 +1859,12 @@ impl CoreAgentTools for SessionTools {
 pub enum ToolCallExecution {
     Completed(ToolInvocationResult),
     /// The call did not execute because the session's active environment is
-    /// still provisioning or booting. The workflow waits for readiness and
-    /// re-dispatches the same call.
+    /// provisioning, waking, booting, or its daemon is reconnecting. The
+    /// workflow waits for readiness and re-dispatches the same call.
     EnvironmentNotReady {
         call_id: harness::ToolCallId,
         environment_id: String,
-        status: environments::EnvironmentStatus,
+        reason: environments::EnvironmentWaitReason,
     },
 }
 
@@ -2042,12 +2009,12 @@ impl SessionTools {
             match environments.active_blocker() {
                 Some(ActiveEnvironmentBlocker::NotReady {
                     environment_id,
-                    status,
+                    reason,
                 }) => {
                     return Ok(ToolCallExecution::EnvironmentNotReady {
                         call_id: call.call_id,
                         environment_id: environment_id.clone(),
-                        status: *status,
+                        reason: *reason,
                     });
                 }
                 Some(blocker @ ActiveEnvironmentBlocker::Unavailable { .. }) => {
@@ -2130,49 +2097,83 @@ impl SessionTools {
             }
         };
         let mut last_status;
+        // A `disconnected` route refusal carries no bound of its own (the row
+        // still reads connected), so consecutive ones are bounded here; once
+        // the row records the disconnect the gate's own bound applies.
+        let mut disconnected_since: Option<tokio::time::Instant> = None;
         loop {
             heartbeat().await;
             let now = i64::try_from(now_unix_ms().unwrap_or_default()).unwrap_or(i64::MAX);
-            match resolver.ready_for_use(&environment_id, now).await {
+            let poll = match resolver.ready_for_use(&environment_id, now).await {
                 Ok(_) => return Outcome::Ready,
                 Err(crate::environments::resolver::EnvironmentResolveError::NotReady {
+                    reason,
+                    retry_after_ms,
+                    until_ms,
+                    ..
+                }) => {
+                    last_status = reason.as_str().to_owned();
+                    if reason == environments::EnvironmentWaitReason::Disconnected
+                        && until_ms.is_none()
+                    {
+                        let since =
+                            *disconnected_since.get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() >= REGISTERED_RECONNECT_WAIT {
+                            return Outcome::Failed {
+                                message: format!(
+                                    "environment {environment_id}: the daemon did not reconnect within {} seconds",
+                                    REGISTERED_RECONNECT_WAIT.as_secs()
+                                ),
+                            };
+                        }
+                    } else {
+                        disconnected_since = None;
+                    }
+                    std::time::Duration::from_millis(retry_after_ms)
+                        .clamp(ENVIRONMENT_RETRY_AFTER_MIN, ENVIRONMENT_RETRY_AFTER_MAX)
+                }
+                Err(crate::environments::resolver::EnvironmentResolveError::Unreachable {
                     status,
                     ..
                 }) => {
-                    last_status = format!("{status:?}").to_lowercase();
-                }
-                Err(
-                    crate::environments::resolver::EnvironmentResolveError::EnvironmentUnavailable {
-                        status,
-                        ..
-                    },
-                ) => {
-                    // Marked ready in the registry but the route probe failed;
-                    // keep polling until the deadline, the daemon may still
-                    // be coming up.
+                    // The dial failed without a typed refusal: a gateway
+                    // restart, a provider 5xx, or a daemon that has not yet
+                    // missed its heartbeat. Keep polling until the deadline.
+                    disconnected_since = None;
                     last_status = status;
+                    temporal_workflow::ENVIRONMENT_READY_POLL_INTERVAL
                 }
                 Err(crate::environments::resolver::EnvironmentResolveError::Store(
                     environments::EnvironmentRegistryError::Store { message },
                 )) => {
                     // Transient store trouble: keep polling.
+                    disconnected_since = None;
                     last_status = format!("store error: {message}");
+                    temporal_workflow::ENVIRONMENT_READY_POLL_INTERVAL
                 }
                 Err(error) => {
                     return Outcome::Failed {
                         message: error.to_string(),
                     };
                 }
-            }
+            };
             if tokio::time::Instant::now() >= deadline {
                 return Outcome::TimedOut { last_status };
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::time::sleep(temporal_workflow::ENVIRONMENT_READY_POLL_INTERVAL.min(remaining))
-                .await;
+            tokio::time::sleep(poll.min(remaining)).await;
         }
     }
 }
+
+/// Bounds on a not-ready wait's `Retry-After` between readiness polls.
+const ENVIRONMENT_RETRY_AFTER_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+const ENVIRONMENT_RETRY_AFTER_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long consecutive `disconnected` route refusals of a persistent
+/// daemon may last before the wait fails; an ephemeral daemon's refusal is
+/// already terminal.
+const REGISTERED_RECONNECT_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(environments::REGISTERED_RECONNECT_WAIT_MS.unsigned_abs());
 
 /// Model-facing text for a call that cannot use the active environment.
 /// A job handle names the session's active environment unless the model
@@ -2199,10 +2200,9 @@ fn active_environment_blocker_message(blocker: &ActiveEnvironmentBlocker) -> Str
     match blocker {
         ActiveEnvironmentBlocker::NotReady {
             environment_id,
-            status,
+            reason,
         } => format!(
-            "active environment {environment_id} is {} and not reachable yet; retry once it is ready",
-            format!("{status:?}").to_lowercase()
+            "active environment {environment_id} is not reachable yet ({reason}); retry once it is ready"
         ),
         ActiveEnvironmentBlocker::Unavailable { message } => {
             format!("active environment is unavailable: {message}")
@@ -2302,8 +2302,50 @@ fn map_environments_error(error: EnvironmentRegistryError) -> CoreAgentIoError {
     io_error(format!("load session environment bindings: {error}"))
 }
 
-fn map_environment_client_error(error: EnvironmentClientError) -> CoreAgentIoError {
+fn map_environment_client_error(error: ClientError) -> CoreAgentIoError {
     io_error(format!("environment data-plane call failed: {error}"))
+}
+
+/// Why an environment record did not become a runtime environment.
+#[derive(Debug)]
+enum RuntimeEnvironmentError {
+    /// The use gate or a typed data-route refusal answered.
+    Refused(crate::environments::resolver::EnvironmentResolveError),
+    Failed(CoreAgentIoError),
+}
+
+impl RuntimeEnvironmentError {
+    /// A wait keeps the call for re-dispatch; anything else fails it.
+    fn into_blocker(self) -> ActiveEnvironmentBlocker {
+        match self {
+            Self::Refused(crate::environments::resolver::EnvironmentResolveError::NotReady {
+                environment_id,
+                reason,
+                ..
+            }) => ActiveEnvironmentBlocker::NotReady {
+                environment_id,
+                reason,
+            },
+            other => ActiveEnvironmentBlocker::Unavailable {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<CoreAgentIoError> for RuntimeEnvironmentError {
+    fn from(error: CoreAgentIoError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl std::fmt::Display for RuntimeEnvironmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(error) => error.fmt(formatter),
+            Self::Failed(error) => error.fmt(formatter),
+        }
+    }
 }
 
 fn map_blob_error(error: BlobStoreError) -> CoreAgentIoError {
@@ -2335,15 +2377,15 @@ mod tests {
     use tools::environment::control::ENVIRONMENT_LIST_TOOL_NAME;
 
     use crate::environments::runtime::RuntimeEnvironment;
-    use environment_protocol::shared::{EnvironmentTransport, ProviderTargetId};
+    use environment_protocol::ids::{JobId, ProviderTargetId};
     use environments::{
-        CreateEnvironment, EnvironmentConnectionSpec, EnvironmentIncarnationId,
-        EnvironmentIncarnationRecord, EnvironmentProviderBindingId,
-        EnvironmentProviderBindingStatus, EnvironmentProviderBindingStore, EnvironmentProviderId,
-        EnvironmentProviderStore, EnvironmentProvisionRequestId, EnvironmentSource,
-        EnvironmentStatus, EnvironmentStore, EnvironmentTemplateId,
-        InMemoryEnvironmentRegistryStore, ObserveProvisionedEnvironment, PutEnvironmentProvider,
-        PutEnvironmentProviderBinding,
+        CreateEnvironment, DaemonBuild, EnvironmentEndpoint, EnvironmentProviderBindingStore,
+        EnvironmentProviderId, EnvironmentProviderStore, EnvironmentProvisionRequestId,
+        EnvironmentSource, EnvironmentState, EnvironmentStore, EnvironmentTemplateId,
+        EnvironmentWaitReason, InMemoryEnvironmentRegistryStore, ObservedTarget, OpenEnvironment,
+        PowerState, ProviderCredentialChange, PutEnvironmentProvider,
+        PutEnvironmentProviderBinding, RecordTargetObservation, RegisteredIdentityMode,
+        RegisteredSource, TargetPhase,
     };
     use harness::{
         BlobRef, ContextEntryKind, FunctionToolSpec, RunId, SessionId, ToolBatchId, ToolCallId,
@@ -2944,9 +2986,7 @@ mod tests {
             let sessions = InMemorySessionStore::new();
             let (session_id, binding) = workflow_tool_session(blobs.as_ref(), &sessions).await;
             let registry = Arc::new(InMemoryEnvironmentRegistryStore::new());
-            let tools = tools.with_environment_resolver(
-                crate::environments::resolver::EnvironmentResolver::new(registry.clone(), registry),
-            );
+            let tools = tools.with_environment_resolver(test_resolver(registry.clone()));
             let sleep_args = blobs.put_bytes(br#"{"ms":50}"#.to_vec()).await.unwrap();
             let workflow_args = blobs
                 .put_bytes(br#"{"status":"complete"}"#.to_vec())
@@ -4256,35 +4296,7 @@ mod tests {
         blobs: Arc<InMemoryBlobStore>,
         process: Arc<RecordingProcessExecutor>,
     ) -> RuntimeEnvironment {
-        let target_id = ProviderTargetId::new("test");
-        let resource = environments::EnvironmentRecord {
-            environment_id: harness::EnvironmentId::new("test"),
-            request_id: EnvironmentProvisionRequestId::new("request-test"),
-            source: EnvironmentSource::Provisioned {
-                provider_id: EnvironmentProviderId::new("test-provider"),
-                binding_id: EnvironmentProviderBindingId::new("test-binding"),
-            },
-            display_name: None,
-            status: EnvironmentStatus::Offline,
-            desired_power: environments::PowerState::Running,
-            idle_policy: None,
-            incarnation: EnvironmentIncarnationRecord {
-                incarnation_id: EnvironmentIncarnationId::new("incarnation-test"),
-                provision_request_id: Some(EnvironmentProvisionRequestId::new("request-test")),
-                provider_target_id: Some(target_id.clone()),
-                template_id: Some(EnvironmentTemplateId::new("test-template")),
-                adoption_source_target: None,
-                power_states: Vec::new(),
-                created_at_ms: 1,
-                updated_at_ms: 1,
-            },
-            public_ingress_enabled: false,
-            public_endpoint: None,
-            metadata: BTreeMap::new(),
-            last_seen_at_ms: None,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-        };
+        let resource = open_test_record("test", "test-provider");
         let fs_context = tools::fs::FsToolContext::new(
             Arc::new(tools::fs::InMemoryFileSystem::full_access()),
             blobs.clone(),
@@ -4298,23 +4310,31 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod transfers {
         use super::*;
-        use environment_protocol::data::transfer_session::{TransferRequest, TransferResponse};
+        use environment_protocol::handshake::ImplementationInfo;
 
-        struct LocalTransfer(environment_daemon::filesystem::LocalFileSystem);
-
-        #[async_trait]
-        impl tools::transfer::EnvironmentTransfer for LocalTransfer {
-            async fn request(
-                &self,
-                request: TransferRequest,
-            ) -> tools::ToolResult<TransferResponse> {
-                self.0
-                    .transfer(request)
-                    .await
-                    .map_err(|error| tools::ToolError::InvalidRequest {
-                        message: error.message,
-                    })
-            }
+        /// envd's data plane over an in-process socket, rooted at `root`
+        /// with its state dir beside it.
+        async fn in_process_envd(root: &std::path::Path, state: &std::path::Path) -> DataClient {
+            let runtime =
+                environment_daemon::DaemonRuntime::new(environment_daemon::config::DaemonConfig {
+                    listen: None,
+                    cwd: root.into(),
+                    fs_root: root.into(),
+                    state_dir: state.into(),
+                    read_only_fs: false,
+                    registration: None,
+                    scrubbed_env: Vec::new(),
+                })
+                .expect("envd runtime");
+            let (client_io, server_io) = tokio::io::duplex(1 << 20);
+            tokio::spawn(environment_daemon::server::serve_stream(runtime, server_io));
+            let options = environment_client::ConnectOptions::new(
+                ImplementationInfo::new("session-tools-test").expect("client info"),
+            );
+            DataClient::connect_initialized_over(client_io, options)
+                .await
+                .expect("connect to in-process envd")
+                .0
         }
 
         async fn dispatch(
@@ -4368,19 +4388,19 @@ mod tests {
                 ] {
                     let (blobs, tools, session_id, workspace_attachments) =
                         session_tools_with_readme_attachment().await;
-                    let root = tempfile::tempdir().unwrap();
-                    let fs = environment_daemon::filesystem::LocalFileSystem::new(
-                        root.path().into(),
-                        root.path().into(),
-                        true,
-                    );
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path().canonicalize().unwrap().join("root");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let client =
+                        in_process_envd(&root, &temp.path().canonicalize().unwrap().join("state"))
+                            .await;
                     let environment = test_environment(
                         blobs.clone(),
                         Arc::new(RecordingProcessExecutor::default()),
                     );
                     let mut context = environment.tool_context().clone();
-                    context.process_cwd = Some(FsPath::new(root.path().to_string_lossy()).unwrap());
-                    context.transfer = Some(Arc::new(LocalTransfer(fs)));
+                    context.process_cwd = Some(FsPath::new(root.to_string_lossy()).unwrap());
+                    context.transfer = Some(Arc::new(client));
                     let environment =
                         RuntimeEnvironment::from_resource(environment.resource().clone(), context);
                     let tools = tools
@@ -4403,20 +4423,17 @@ mod tests {
                     let result = dispatch(&tools, request.clone(), batch).await;
                     succeeded(&blobs, &result).await;
                     assert_eq!(
-                        std::fs::read(root.path().join("created/nested/README.md")).unwrap(),
+                        std::fs::read(root.join("created/nested/README.md")).unwrap(),
                         b"hello\n"
                     );
 
                     // A completed retry through the hosted path must keep its operation
                     // identity and preserve edits made after publication.
-                    std::fs::write(
-                        root.path().join("created/nested/README.md"),
-                        b"environment edit",
-                    )
-                    .unwrap();
+                    std::fs::write(root.join("created/nested/README.md"), b"environment edit")
+                        .unwrap();
                     succeeded(&blobs, &dispatch(&tools, request.clone(), batch).await).await;
                     assert_eq!(
-                        std::fs::read(root.path().join("created/nested/README.md")).unwrap(),
+                        std::fs::read(root.join("created/nested/README.md")).unwrap(),
                         b"environment edit"
                     );
 
@@ -4503,6 +4520,49 @@ mod tests {
         }
     }
 
+    fn test_daemon_build() -> DaemonBuild {
+        DaemonBuild {
+            version: Some("test".to_owned()),
+            git_sha: None,
+            protocol_version: environment_protocol::ENVD_PROTOCOL_VERSION,
+        }
+    }
+
+    fn test_create_environment(
+        environment_id: &str,
+        provider_id: &str,
+        created_at_ms: i64,
+    ) -> CreateEnvironment {
+        CreateEnvironment {
+            request_id: EnvironmentProvisionRequestId::new(format!("request-{environment_id}")),
+            environment_id: EnvironmentId::new(environment_id),
+            provider_id: EnvironmentProviderId::new(provider_id),
+            template_id: EnvironmentTemplateId::new("test-template"),
+            idle: None,
+            display_name: None,
+            metadata: BTreeMap::new(),
+            created_at_ms,
+        }
+    }
+
+    /// An open provisioned record, built without a store.
+    fn open_test_record(
+        environment_id: &str,
+        provider_id: &str,
+    ) -> environments::EnvironmentRecord {
+        let mut record = test_create_environment(environment_id, provider_id, 1)
+            .record()
+            .expect("provisioned record");
+        OpenEnvironment {
+            environment_id: record.environment_id.clone(),
+            daemon_build: test_daemon_build(),
+            at_ms: 2,
+        }
+        .apply(&mut record)
+        .expect("open record");
+        record
+    }
+
     async fn register_test_environment_provider(
         store: &InMemoryEnvironmentRegistryStore,
         provider_id: &str,
@@ -4511,11 +4571,12 @@ mod tests {
             .put_provider(PutEnvironmentProvider {
                 provider_id: EnvironmentProviderId::new(provider_id),
                 display_name: None,
-                controller_connection: EnvironmentConnectionSpec::new(
-                    "http://controller.test",
-                    EnvironmentTransport::Http,
-                ),
-                metadata: BTreeMap::new(),
+                controller_endpoint: EnvironmentEndpoint::parse("ws://controller.test/control")
+                    .unwrap(),
+                data_route_base: None,
+                credential: ProviderCredentialChange::Set(auth::SecretValue::new(
+                    "provider-credential",
+                )),
                 updated_at_ms: 10,
             })
             .await
@@ -4523,113 +4584,162 @@ mod tests {
         store
             .put_provider_binding(PutEnvironmentProviderBinding {
                 universe_id: store.universe_id(),
-                binding_id: EnvironmentProviderBindingId::new(format!("binding-{provider_id}")),
                 provider_id: EnvironmentProviderId::new(provider_id),
-                status: EnvironmentProviderBindingStatus::Enabled,
-                expected_revision: None,
-                metadata: BTreeMap::new(),
+                enabled: true,
                 updated_at_ms: 10,
             })
             .await
             .expect("register provider binding");
     }
 
-    async fn observe_test_environment(
+    /// Create a provisioned environment and open it, as the reconciler does
+    /// after its first handshake.
+    async fn open_test_environment(
         store: &InMemoryEnvironmentRegistryStore,
         environment_id: &str,
         provider_id: &str,
-        observed_at_ms: i64,
+        opened_at_ms: i64,
     ) {
-        let target_id = ProviderTargetId::new(format!("target-{environment_id}"));
-        let environment_id = EnvironmentId::new(environment_id);
-        store
-            .create_environment(CreateEnvironment {
-                request_id: EnvironmentProvisionRequestId::new(format!("request-{environment_id}")),
-                environment_id: environment_id.clone(),
-                incarnation_id: EnvironmentIncarnationId::new(format!(
-                    "incarnation-{environment_id}"
-                )),
-                binding_id: EnvironmentProviderBindingId::new(format!("binding-{provider_id}")),
-                template_id: EnvironmentTemplateId::new("test-template"),
-                display_name: None,
-                metadata: BTreeMap::new(),
-
-                idle_policy: None,
-                created_at_ms: observed_at_ms.saturating_sub(1),
-            })
+        let created = store
+            .create_environment(test_create_environment(
+                environment_id,
+                provider_id,
+                opened_at_ms.saturating_sub(1),
+            ))
             .await
             .expect("create environment");
         store
-            .observe_provisioned_environment(ObserveProvisionedEnvironment {
-                environment_id,
-                provider_target_id: target_id,
-                status: EnvironmentStatus::Offline,
-                power_states: Vec::new(),
-                observed_at_ms,
+            .record_target_observation(RecordTargetObservation {
+                environment_id: created.environment_id.clone(),
+                provider_target_id: Some(
+                    ProviderTargetId::new(format!("target-{environment_id}")).unwrap(),
+                ),
+                observed: ObservedTarget {
+                    phase: TargetPhase::Active,
+                    power: Some(PowerState::Running),
+                    message: None,
+                    observed_at_ms: opened_at_ms,
+                },
+                public_endpoint: None,
+                observed_at_ms: opened_at_ms,
             })
             .await
-            .expect("observe environment");
+            .expect("record target");
+        store
+            .open_environment(OpenEnvironment {
+                environment_id: created.environment_id,
+                daemon_build: test_daemon_build(),
+                at_ms: opened_at_ms,
+            })
+            .await
+            .expect("open environment");
+    }
+
+    fn test_resolver(
+        registry: Arc<InMemoryEnvironmentRegistryStore>,
+    ) -> crate::environments::resolver::EnvironmentResolver {
+        crate::environments::resolver::EnvironmentResolver::new(registry)
+    }
+
+    #[test]
+    fn status_messages_tell_the_model_what_a_tool_call_will_meet() {
+        let open = open_test_record("environment-1", "allowed");
+        assert_eq!(environment_status_message(&open), None);
+
+        let mut paused = open.clone();
+        if let EnvironmentSource::Provisioned(source) = &mut paused.source {
+            source.observed = Some(ObservedTarget {
+                phase: TargetPhase::Active,
+                power: Some(PowerState::Paused),
+                message: None,
+                observed_at_ms: 3,
+            });
+        }
+        assert_eq!(
+            environment_status_message(&paused).as_deref(),
+            Some("Environment is paused. Tools that use it wake it and wait until it is ready.")
+        );
+
+        let mut failed = open.clone();
+        failed.state = EnvironmentState::Failed;
+        failed.state_message = Some("no capacity".to_owned());
+        assert_eq!(
+            environment_status_message(&failed).as_deref(),
+            Some("no capacity")
+        );
+
+        let away = |identity_mode| {
+            let mut record = open.clone();
+            record.source = EnvironmentSource::Registered(RegisteredSource {
+                registration_key_id: environments::EnvironmentRegistrationKeyId::new("key"),
+                daemon_public_key: "00".repeat(32),
+                identity_mode,
+                connected: false,
+                connection_changed_at_ms: 3,
+                last_seen_at_ms: 3,
+            });
+            record
+        };
+        assert_eq!(
+            environment_status_message(&away(RegisteredIdentityMode::Persistent)).as_deref(),
+            Some("The daemon is disconnected; tools wait up to two minutes for it to reconnect.")
+        );
+        assert_eq!(
+            environment_status_message(&away(RegisteredIdentityMode::Ephemeral)).as_deref(),
+            Some("The daemon is disconnected.")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn environment_read_status_message_only_describes_supported_wake_on_use() {
-        use environments::PowerState;
-
-        for (status, power_states, expected_status, expected_message) in [
+    async fn environment_views_report_display_status_and_wake_messages() {
+        for (power, expected_status, expected_message) in [
+            (Some(PowerState::Running), "ready", None),
             (
-                EnvironmentStatus::Paused,
-                vec![PowerState::Running],
+                Some(PowerState::Paused),
                 "paused",
-                true,
+                Some(
+                    "Environment is paused. Tools that use it wake it and wait until it is ready.",
+                ),
             ),
             (
-                EnvironmentStatus::Suspended,
-                vec![PowerState::Running],
+                Some(PowerState::Suspended),
                 "suspended",
-                true,
+                Some(
+                    "Environment is suspended. Tools that use it wake it and wait until it is ready.",
+                ),
             ),
             (
-                EnvironmentStatus::Offline,
-                vec![PowerState::Running],
-                "offline",
-                true,
-            ),
-            (EnvironmentStatus::Paused, Vec::new(), "paused", false),
-            (EnvironmentStatus::Suspended, Vec::new(), "suspended", false),
-            (EnvironmentStatus::Offline, Vec::new(), "offline", false),
-            (
-                EnvironmentStatus::Ready,
-                vec![PowerState::Running],
-                "ready",
-                false,
-            ),
-            (
-                EnvironmentStatus::Failed,
-                vec![PowerState::Running],
-                "failed",
-                false,
+                Some(PowerState::Stopped),
+                "stopped",
+                Some(
+                    "Environment is stopped. Tools that use it wake it and wait until it is ready.",
+                ),
             ),
         ] {
             let blobs = Arc::new(InMemoryBlobStore::new());
             let registry = Arc::new(InMemoryEnvironmentRegistryStore::new());
             register_test_environment_provider(registry.as_ref(), "allowed").await;
             let environment_id = EnvironmentId::new("environment-allowed-1");
-            observe_test_environment(registry.as_ref(), environment_id.as_str(), "allowed", 10)
-                .await;
+            open_test_environment(registry.as_ref(), environment_id.as_str(), "allowed", 10).await;
             registry
-                .observe_provisioned_environment(ObserveProvisionedEnvironment {
+                .record_target_observation(RecordTargetObservation {
                     environment_id: environment_id.clone(),
-                    provider_target_id: ProviderTargetId::new("target-environment-allowed-1"),
-                    status,
-                    power_states,
+                    provider_target_id: Some(
+                        ProviderTargetId::new("target-environment-allowed-1").unwrap(),
+                    ),
+                    observed: ObservedTarget {
+                        phase: TargetPhase::Active,
+                        power,
+                        message: None,
+                        observed_at_ms: 11,
+                    },
+                    public_endpoint: None,
                     observed_at_ms: 11,
                 })
                 .await
-                .expect("observe status and power support");
-            let resolver =
-                crate::environments::resolver::EnvironmentResolver::new(registry.clone(), registry);
+                .expect("observe power");
             let tools = SessionTools::new(blobs.clone(), Arc::new(TestCatalog::default()))
-                .with_environment_resolver(resolver);
+                .with_environment_resolver(test_resolver(registry));
             blobs.put_bytes(b"{}".to_vec()).await.expect("arguments");
 
             for tool_name in ["environment_read", "environment_list"] {
@@ -4664,15 +4774,11 @@ mod tests {
                     &output["environments"][0]
                 };
                 assert_eq!(view["status"], expected_status);
-                if tool_name == "environment_read" && expected_message {
-                    assert_eq!(
-                        view["status_message"],
-                        format!(
-                            "Environment is {expected_status}. Tools that use this environment will automatically wake it and wait until it is ready. You can proceed normally."
-                        ),
-                    );
-                } else {
-                    assert!(view.get("status_message").is_none(), "{tool_name}: {view}");
+                assert!(view.get("provider_id").is_none(), "{tool_name}: {view}");
+                assert!(view.get("observed_at_ms").is_none(), "{tool_name}: {view}");
+                match expected_message {
+                    Some(message) => assert_eq!(view["status_message"], message),
+                    None => assert!(view.get("status_message").is_none(), "{tool_name}: {view}"),
                 }
             }
         }
@@ -4685,9 +4791,8 @@ mod tests {
         let blobs = Arc::new(InMemoryBlobStore::new());
         let registry = Arc::new(InMemoryEnvironmentRegistryStore::new());
         register_test_environment_provider(registry.as_ref(), "allowed").await;
-        observe_test_environment(registry.as_ref(), id, "allowed", 10).await;
-        let resolver =
-            crate::environments::resolver::EnvironmentResolver::new(registry.clone(), registry);
+        open_test_environment(registry.as_ref(), id, "allowed", 10).await;
+        let resolver = test_resolver(registry.clone());
         let tools = SessionTools::new(blobs.clone(), Arc::new(TestCatalog::default()))
             .with_environment_resolver(resolver);
         let policy = test_environment_policy(&[id]);
@@ -4723,7 +4828,7 @@ mod tests {
             Some(&policy),
             JobHandleArg {
                 environment_id: Some(handle.into()),
-                job_id: environment_protocol::shared::JobId::new("build"),
+                job_id: JobId::new("build").unwrap(),
             },
         )
         .unwrap();
@@ -4744,7 +4849,7 @@ mod tests {
                 Some(&test_environment_policy(&["other"])),
                 JobHandleArg {
                     environment_id: Some(handle.into()),
-                    job_id: environment_protocol::shared::JobId::new("build"),
+                    job_id: JobId::new("build").unwrap(),
                 }
             )
             .is_err()
@@ -4757,11 +4862,8 @@ mod tests {
         let catalog = Arc::new(TestCatalog::default());
         let registry = Arc::new(InMemoryEnvironmentRegistryStore::new());
         register_test_environment_provider(registry.as_ref(), "allowed").await;
-        observe_test_environment(registry.as_ref(), "environment-allowed-1", "allowed", 10).await;
-        let resolver = crate::environments::resolver::EnvironmentResolver::new(
-            registry.clone(),
-            registry.clone(),
-        );
+        open_test_environment(registry.as_ref(), "environment-allowed-1", "allowed", 10).await;
+        let resolver = test_resolver(registry.clone());
         let tools = SessionTools::new(blobs.clone(), catalog).with_environment_resolver(resolver);
         let arguments_ref = blobs
             .put_bytes(br#"{}"#.to_vec())
@@ -4820,24 +4922,14 @@ mod tests {
         register_test_environment_provider(registry.as_ref(), "allowed").await;
         // Created but never observed: the environment is still provisioning.
         registry
-            .create_environment(CreateEnvironment {
-                request_id: EnvironmentProvisionRequestId::new("request-pending"),
-                environment_id: EnvironmentId::new("environment-pending"),
-                incarnation_id: EnvironmentIncarnationId::new("incarnation-pending"),
-                binding_id: EnvironmentProviderBindingId::new("binding-allowed"),
-                template_id: EnvironmentTemplateId::new("test-template"),
-                display_name: None,
-                metadata: BTreeMap::new(),
-
-                idle_policy: None,
-                created_at_ms: 10,
-            })
+            .create_environment(test_create_environment(
+                "environment-pending",
+                "allowed",
+                10,
+            ))
             .await
             .expect("create environment");
-        let resolver = crate::environments::resolver::EnvironmentResolver::new(
-            registry.clone(),
-            registry.clone(),
-        );
+        let resolver = test_resolver(registry.clone());
         let tools = SessionTools::new(blobs.clone(), catalog).with_environment_resolver(resolver);
         let arguments_ref = blobs
             .put_bytes(br#"{"path":"README.md"}"#.to_vec())
@@ -4887,7 +4979,7 @@ mod tests {
             execution,
             ToolCallExecution::EnvironmentNotReady {
                 ref environment_id,
-                status: EnvironmentStatus::Provisioning,
+                reason: EnvironmentWaitReason::Provisioning,
                 ..
             } if environment_id == "environment-pending"
         ));
@@ -4896,18 +4988,16 @@ mod tests {
         let result = tools.invoke_call(request).await.expect("invoke call");
         assert_eq!(result.status, harness::ToolCallStatus::Failed);
 
-        // Once observed ready, resolution no longer blocks (the route probe
-        // itself is exercised by live tests).
+        // Once open, the gate no longer blocks (the route probe itself is
+        // exercised by live tests).
         registry
-            .observe_provisioned_environment(ObserveProvisionedEnvironment {
+            .open_environment(OpenEnvironment {
                 environment_id: EnvironmentId::new("environment-pending"),
-                provider_target_id: ProviderTargetId::new("target-pending"),
-                status: EnvironmentStatus::Ready,
-                power_states: Vec::new(),
-                observed_at_ms: 20,
+                daemon_build: test_daemon_build(),
+                at_ms: 20,
             })
             .await
-            .expect("observe ready");
+            .expect("open environment");
         let outcome = tools
             .await_environment_ready(
                 &temporal_workflow::AwaitEnvironmentReadyActivityRequest {
@@ -4932,19 +5022,17 @@ mod tests {
         let blobs = Arc::new(InMemoryBlobStore::new());
         let registry = Arc::new(InMemoryEnvironmentRegistryStore::new());
         register_test_environment_provider(registry.as_ref(), "allowed").await;
-        observe_test_environment(registry.as_ref(), "environment-failed", "allowed", 10).await;
+        open_test_environment(registry.as_ref(), "environment-failed", "allowed", 10).await;
         registry
-            .fail_environment_lifecycle(environments::FailEnvironmentLifecycle {
+            .fail_environment(environments::FailEnvironment {
                 environment_id: EnvironmentId::new("environment-failed"),
                 message: "no capacity".to_owned(),
-                observed_at_ms: 11,
+                daemon_build: None,
+                at_ms: 11,
             })
             .await
             .expect("fail environment");
-        let resolver = crate::environments::resolver::EnvironmentResolver::new(
-            registry.clone(),
-            registry.clone(),
-        );
+        let resolver = test_resolver(registry.clone());
         let tools = SessionTools::new(blobs, Arc::new(TestCatalog::default()))
             .with_environment_resolver(resolver);
         let outcome = tools
@@ -5016,12 +5104,9 @@ mod tests {
         let registry = Arc::new(InMemoryEnvironmentRegistryStore::new());
         register_test_environment_provider(registry.as_ref(), "allowed").await;
         register_test_environment_provider(registry.as_ref(), "denied").await;
-        observe_test_environment(registry.as_ref(), "environment-allowed-1", "allowed", 10).await;
-        observe_test_environment(registry.as_ref(), "environment-denied", "denied", 10).await;
-        let resolver = crate::environments::resolver::EnvironmentResolver::new(
-            registry.clone(),
-            registry.clone(),
-        );
+        open_test_environment(registry.as_ref(), "environment-allowed-1", "allowed", 10).await;
+        open_test_environment(registry.as_ref(), "environment-denied", "denied", 10).await;
+        let resolver = test_resolver(registry.clone());
         let tools = SessionTools::new(blobs.clone(), catalog).with_environment_resolver(resolver);
         let arguments_ref = blobs
             .put_bytes(br#"{}"#.to_vec())
@@ -5079,7 +5164,7 @@ mod tests {
         );
         assert_eq!(first_environments[0]["active"], true);
         assert_eq!(first_environments[0]["access"], "read, edit, exec, jobs");
-        assert_eq!(first_environments[0]["status"], "offline");
+        assert_eq!(first_environments[0]["status"], "ready");
         assert_eq!(
             first_environments[1]["environment_id"],
             "environment-allowed-2"
@@ -5091,7 +5176,7 @@ mod tests {
                 .any(|environment| environment["environment_id"] == "environment-denied")
         );
 
-        observe_test_environment(registry.as_ref(), "environment-allowed-2", "allowed", 20).await;
+        open_test_environment(registry.as_ref(), "environment-allowed-2", "allowed", 20).await;
         let second = tools
             .invoke_batch(request)
             .await
@@ -5114,7 +5199,7 @@ mod tests {
             .as_array()
             .expect("second environments");
         assert_eq!(second_environments.len(), 2);
-        assert_eq!(second_environments[1]["status"], "offline");
+        assert_eq!(second_environments[1]["status"], "ready");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5742,7 +5827,7 @@ mod tests {
             ])),
             JobHandleArg {
                 environment_id: None,
-                job_id: environment_protocol::shared::JobId::new("build"),
+                job_id: JobId::new("build").unwrap(),
             },
         )
         .expect("defaults to the active environment");
@@ -5757,7 +5842,7 @@ mod tests {
             ])),
             JobHandleArg {
                 environment_id: Some("environment_other".to_owned()),
-                job_id: environment_protocol::shared::JobId::new("build"),
+                job_id: JobId::new("build").unwrap(),
             },
         )
         .expect("explicit environment wins");
@@ -5769,7 +5854,7 @@ mod tests {
                 None,
                 JobHandleArg {
                     environment_id: None,
-                    job_id: environment_protocol::shared::JobId::new("build"),
+                    job_id: JobId::new("build").unwrap(),
                 },
             )
             .is_err(),

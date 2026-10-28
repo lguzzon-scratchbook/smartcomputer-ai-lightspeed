@@ -1368,86 +1368,116 @@ export type MethodGroup =
   | "deployment/environment-providers"
   | "deployment/channels";
 /**
- * Steady power state of a provisioned environment.
+ * Why an environment is closing or closed.
  *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentPowerStateView".
+ * via the `definition` "EnvironmentCloseReasonView".
  */
-export type EnvironmentPowerStateView = "running" | "paused" | "suspended" | "stopped";
+export type EnvironmentCloseReasonView =
+  "requested" | "keyRevoked" | "ephemeralGrace" | "departed" | "offlineTimeout" | "providerEnded";
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentSourceView".
  */
 export type EnvironmentSourceView =
   | {
-      bindingId: string;
+      /**
+       * The create-time idle policy, when one replaced the template's.
+       */
+      idle?: EnvironmentIdlePolicyView | null;
+      /**
+       * Absent until the provider first reported the target.
+       */
+      observed?: EnvironmentObservedTargetView | null;
       providerId: string;
+      /**
+       * The public endpoint the provider last reported.
+       */
+      publicEndpoint?: string | null;
+      /**
+       * The provider's handle for the target; absent until the provider
+       * accepted the create.
+       */
+      targetId?: string | null;
+      templateId: string;
       type: "provisioned";
     }
   | {
-      connection: EnvironmentConnectionView;
+      /**
+       * `ws://`, `wss://` or `unix://` URL Lightspeed dials envd at.
+       */
+      endpoint: string;
       type: "external";
     }
   | {
+      /**
+       * The daemon's control connection is up.
+       */
+      connected: boolean;
+      /**
+       * When the daemon last connected or disconnected.
+       */
+      connectionChangedAtMs: number;
       daemonId: string;
+      /**
+       * The admitting key's identity mode.
+       */
       identityMode: EnvironmentIdentityModeView;
+      /**
+       * When the gateway last recorded the daemon's control connection:
+       * at connect, at disconnect, and at most every five minutes while
+       * connected.
+       */
+      lastSeenAtMs: number;
       registrationKeyId: string;
       type: "registered";
     };
 /**
+ * Lifecycle phase of a provider target, as the provider reports it.
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentConnectionTransportView".
+ * via the `definition` "EnvironmentTargetPhaseView".
  */
-export type EnvironmentConnectionTransportView =
-  | ("webSocket" | "http" | "stdio" | "ssh")
-  | {
-      provider: {
-        provider_type: string;
-      };
-    };
+export type EnvironmentTargetPhaseView =
+  "provisioning" | "active" | "closing" | "closed" | "failed" | "unknown";
 /**
- * What Lightspeed does with a registered environment while its daemon is
- * disconnected. Registration-key policy, copied onto each environment.
+ * Power state of a provisioned environment's target.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentPowerStateView".
+ */
+export type EnvironmentPowerStateView = "running" | "paused" | "suspended" | "stopped";
+/**
+ * What happens to a registered environment while its daemon is
+ * disconnected. Policy of the registration key that admitted it.
  *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentIdentityModeView".
  */
 export type EnvironmentIdentityModeView = "persistent" | "ephemeral";
 /**
+ * The lifecycle Lightspeed owns. External and registered environments are
+ * only ever `open` or `closed`.
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentLifecycleStatusView".
+ * via the `definition` "EnvironmentStateView".
  */
-export type EnvironmentLifecycleStatusView =
-  | ("provisioning" | "booting" | "ready" | "closing" | "closed" | "failed" | "unknown")
+export type EnvironmentStateView = ("open" | "closed") | "provisioning" | "closing" | "failed";
+/**
+ * Display status derived from `state` and the latest observation; never
+ * stored. Tools that use a paused, suspended or stopped environment wake
+ * it.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentStatusView".
+ */
+export type EnvironmentStatusView =
+  | ("provisioning" | "ready" | "closing" | "closed" | "failed")
   | "paused"
   | "suspended"
-  | "offline";
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "DeploymentEnvironmentProviderTransport".
- */
-export type DeploymentEnvironmentProviderTransport =
-  | {
-      type: "webSocket";
-    }
-  | {
-      type: "http";
-    }
-  | {
-      type: "stdio";
-    }
-  | {
-      type: "ssh";
-    }
-  | {
-      providerType: string;
-      type: "provider";
-    };
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentProviderBindingStatusView".
- */
-export type EnvironmentProviderBindingStatusView = "enabled" | "disabled";
+  | "stopped"
+  | "unknown"
+  | "away";
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentCredentialSourceView".
@@ -1466,26 +1496,53 @@ export type EnvironmentCredentialSourceView =
       type: "directSecret";
     };
 /**
+ * How a job's root process ended.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "SessionJobExitView".
+ */
+export type SessionJobExitView =
+  | {
+      code: number;
+      type: "code";
+    }
+  | {
+      coreDumped?: boolean;
+      signal: string;
+      type: "signal";
+    };
+/**
+ * Job lifecycle. `queued` and `running` are live; the rest are terminal.
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "SessionJobStatusView".
  */
 export type SessionJobStatusView =
-  | "accepted"
-  | "queued"
   | "running"
+  | "queued"
   | "succeeded"
   | "failed"
-  | "cancelRequested"
-  | "cancelled"
   | "timedOut"
+  | "cancelled"
   | "dependencyFailed"
-  | "interrupted"
-  | "lost";
+  | "interrupted";
+/**
+ * Why Lightspeed stopped a running job.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "SessionJobStoppedByView".
+ */
+export type SessionJobStoppedByView = "timeout" | "terminate" | "kill";
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "SessionJobOutputStreamView".
  */
 export type SessionJobOutputStreamView = "stdout" | "stderr";
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "SessionJobOutputGapReasonView".
+ */
+export type SessionJobOutputGapReasonView = "overflow" | "expired";
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentRegistrationKeyStatusView".
@@ -4704,89 +4761,6 @@ export interface DeletedSessionView {
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "AgentApiOutcomeOfDeploymentEnvironmentAdoptResponse".
- */
-export interface AgentApiOutcomeOfDeploymentEnvironmentAdoptResponse {
-  notifications?: AgentNotification[];
-  result: DeploymentEnvironmentAdoptResponse;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "DeploymentEnvironmentAdoptResponse".
- */
-export interface DeploymentEnvironmentAdoptResponse {
-  environment: EnvironmentView;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentView".
- */
-export interface EnvironmentView {
-  createdAtMs: number;
-  /**
-   * Lightspeed-owned power intent; `status` is the observed state.
-   */
-  desiredPower: EnvironmentPowerStateView;
-  displayName?: string | null;
-  environmentId: string;
-  idlePolicy?: EnvironmentIdlePolicyView | null;
-  incarnation: EnvironmentIncarnationView;
-  /**
-   * Registered environments only: when the gateway last saw the daemon's
-   * control connection.
-   */
-  lastSeenAtMs?: number | null;
-  metadata?: {
-    [k: string]: string;
-  };
-  publicEndpoint?: string | null;
-  publicIngressEnabled: boolean;
-  requestId: string;
-  source: EnvironmentSourceView;
-  status: EnvironmentLifecycleStatusView;
-  updatedAtMs: number;
-}
-/**
- * Staged idle policy. Thresholds are milliseconds of daemon-reported idle
- * time and must be non-decreasing in the order pause, suspend, stop, close.
- * Stages whose power state the provider does not support are skipped.
- *
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentIdlePolicyView".
- */
-export interface EnvironmentIdlePolicyView {
-  closeAfterMs?: number | null;
-  pauseAfterMs?: number | null;
-  stopAfterMs?: number | null;
-  suspendAfterMs?: number | null;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentIncarnationView".
- */
-export interface EnvironmentIncarnationView {
-  createdAtMs: number;
-  incarnationId: string;
-  /**
-   * Power states the provider reported for this target; empty until
-   * observed or when the provider offers no power control.
-   */
-  powerStates?: EnvironmentPowerStateView[];
-  providerTargetId?: string | null;
-  provisionRequestId?: string | null;
-  templateId?: string | null;
-  updatedAtMs: number;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentConnectionView".
- */
-export interface EnvironmentConnectionView {
-  endpoint: string;
-  transport: EnvironmentConnectionTransportView;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "AgentApiOutcomeOfDeploymentEnvironmentProviderDeleteResponse".
  */
 export interface AgentApiOutcomeOfDeploymentEnvironmentProviderDeleteResponse {
@@ -4805,22 +4779,30 @@ export interface DeploymentEnvironmentProviderDeleteResponse {
  * via the `definition` "DeploymentEnvironmentProviderView".
  */
 export interface DeploymentEnvironmentProviderView {
-  controllerConnection: DeploymentEnvironmentProviderConnection;
+  /**
+   * `ws://`, `wss://` or `unix://` URL of the provider controller.
+   */
+  controllerEndpoint: string;
   createdAtMs: number;
+  /**
+   * Operator-configured `ws://` or `wss://` base of the provider's data
+   * routes; absent derives it from the controller endpoint.
+   */
+  dataRouteBase?: string | null;
   displayName?: string | null;
-  metadata?: {
-    [k: string]: string;
-  };
+  /**
+   * The data route base Lightspeed dials: `dataRouteBase`, or the
+   * controller endpoint's origin followed by `/routes`. Absent only when it
+   * cannot be derived.
+   */
+  effectiveDataRouteBase?: string | null;
+  /**
+   * A bearer credential is stored and presented to the controller and
+   * data routes; without one no `Authorization` header is sent.
+   */
+  hasCredential: boolean;
   providerId: string;
   updatedAtMs: number;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "DeploymentEnvironmentProviderConnection".
- */
-export interface DeploymentEnvironmentProviderConnection {
-  endpoint: string;
-  transport: DeploymentEnvironmentProviderTransport;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -4883,18 +4865,16 @@ export interface DeploymentProviderBindingDeleteResponse {
   binding: EnvironmentProviderBindingView;
 }
 /**
+ * A universe's binding to a deployment provider. Creates, templates and
+ * data routes of the provider need it enabled.
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentProviderBindingView".
  */
 export interface EnvironmentProviderBindingView {
-  bindingId: string;
   createdAtMs: number;
-  metadata?: {
-    [k: string]: string;
-  };
+  enabled: boolean;
   providerId: string;
-  revision: number;
-  status: EnvironmentProviderBindingStatusView;
   updatedAtMs: number;
 }
 /**
@@ -5045,6 +5025,92 @@ export interface EnvironmentCloseResponse {
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentView".
+ */
+export interface EnvironmentView {
+  /**
+   * Present exactly while `state` is `closing` or `closed`.
+   */
+  closeReason?: EnvironmentCloseReasonView | null;
+  closedAtMs?: number | null;
+  createdAtMs: number;
+  /**
+   * The envd build serving the environment; absent until known.
+   */
+  daemon?: EnvironmentDaemonView | null;
+  displayName?: string | null;
+  environmentId: string;
+  /**
+   * Caller metadata.
+   */
+  metadata?: {
+    [k: string]: string;
+  };
+  /**
+   * The caller's retry identity; absent for registered environments.
+   */
+  requestId?: string | null;
+  source: EnvironmentSourceView;
+  state: EnvironmentStateView;
+  /**
+   * When `state` last changed.
+   */
+  stateChangedAtMs: number;
+  /**
+   * Why the environment failed, or what provisioning or closing is
+   * waiting on.
+   */
+  stateMessage?: string | null;
+  status: EnvironmentStatusView;
+  updatedAtMs: number;
+}
+/**
+ * The envd build serving an environment, from its registration or
+ * Lightspeed's open handshake.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentDaemonView".
+ */
+export interface EnvironmentDaemonView {
+  gitSha?: string | null;
+  protocolVersion: number;
+  version?: string | null;
+}
+/**
+ * Staged idle policy the provider applies. Thresholds are milliseconds of
+ * envd-reported idle time (running processes, jobs and leftover process
+ * groups hold it at zero) and must be non-decreasing in the order pause,
+ * suspend, stop, close. Stages whose power state the template does not
+ * support are skipped.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentIdlePolicyView".
+ */
+export interface EnvironmentIdlePolicyView {
+  closeAfterMs?: number | null;
+  pauseAfterMs?: number | null;
+  stopAfterMs?: number | null;
+  suspendAfterMs?: number | null;
+}
+/**
+ * What the provider last reported about a provisioned environment's
+ * target. Display only: Lightspeed never converges it, and it may be up to
+ * a few minutes old.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentObservedTargetView".
+ */
+export interface EnvironmentObservedTargetView {
+  message?: string | null;
+  observedAtMs: number;
+  phase: EnvironmentTargetPhaseView;
+  /**
+   * Present only while `phase` is `active`.
+   */
+  power?: EnvironmentPowerStateView | null;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "AgentApiOutcomeOfEnvironmentCreateResponse".
  */
 export interface AgentApiOutcomeOfEnvironmentCreateResponse {
@@ -5131,21 +5197,6 @@ export interface EnvironmentExternalCreateResponse {
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "AgentApiOutcomeOfEnvironmentIdlePolicyPutResponse".
- */
-export interface AgentApiOutcomeOfEnvironmentIdlePolicyPutResponse {
-  notifications?: AgentNotification[];
-  result: EnvironmentIdlePolicyPutResponse;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentIdlePolicyPutResponse".
- */
-export interface EnvironmentIdlePolicyPutResponse {
-  environment: EnvironmentView;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "AgentApiOutcomeOfEnvironmentIngressPutResponse".
  */
 export interface AgentApiOutcomeOfEnvironmentIngressPutResponse {
@@ -5192,18 +5243,31 @@ export interface SessionJobHandleView {
   jobId: string;
 }
 /**
+ * What a job is and how it ended. Instants are the environment's wall
+ * clock.
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "SessionJobSummaryView".
  */
 export interface SessionJobSummaryView {
+  /**
+   * When a cancel reached the job while it ran.
+   */
+  cancelRequestedAtMs?: number | null;
   createdAtMs: number;
   dependencies?: string[];
-  exitCode?: number | null;
+  /**
+   * Run time from start to finish, immune to clock jumps.
+   */
+  durationMs?: number | null;
+  /**
+   * How the job's root process ended, once it ran and exited.
+   */
+  exit?: SessionJobExitView | null;
   failure?: string | null;
   finishedAtMs?: number | null;
   jobId: string;
   name?: string | null;
-  namespace: string;
   /**
    * True when the job's root process exited while descendants it spawned
    * were still running; the host terminated them best-effort at job
@@ -5212,8 +5276,16 @@ export interface SessionJobSummaryView {
   orphanedDescendants?: boolean;
   queueKey?: string | null;
   queuedAtMs?: number | null;
+  /**
+   * The start request that created the job; part of its identity.
+   */
+  requestId: string;
   startedAtMs?: number | null;
   status: SessionJobStatusView;
+  /**
+   * Set when Lightspeed stopped the running job.
+   */
+  stoppedBy?: SessionJobStoppedByView | null;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -5261,27 +5333,34 @@ export interface EnvironmentJobReadResponse {
   jobs?: SessionJobReadEntryView[];
 }
 /**
+ * One job's summary and output page, or why it could not be read: an
+ * entry with `error` and no summary names a job the environment does not
+ * know (never created, or garbage-collected).
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "SessionJobReadEntryView".
  */
 export interface SessionJobReadEntryView {
-  artifacts?: SessionJobArtifactView[];
   error?: string | null;
   handle?: SessionJobHandleView | null;
+  /**
+   * Output in offset order.
+   */
   outputChunks?: SessionJobOutputChunkView[];
-  outputNextSeq: number;
+  /**
+   * Output bytes the job produced so far; final once it is terminal.
+   */
+  outputEnd: number;
+  /**
+   * Output ranges between the requested start and `outputNext` that
+   * cannot be returned.
+   */
+  outputGaps?: SessionJobOutputGapView[];
+  /**
+   * Byte offset to continue reading from: pass it as `after`.
+   */
+  outputNext: number;
   summary?: SessionJobSummaryView | null;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "SessionJobArtifactView".
- */
-export interface SessionJobArtifactView {
-  kind?: string | null;
-  metadata?: {
-    [k: string]: string;
-  };
-  path: string;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -5289,8 +5368,23 @@ export interface SessionJobArtifactView {
  */
 export interface SessionJobOutputChunkView {
   dataBase64: string;
-  seq: number;
+  /**
+   * Byte offset of the chunk's first byte in the job's combined output.
+   */
+  offset: number;
   stream: SessionJobOutputStreamView;
+}
+/**
+ * Output bytes in `[offset, offset + omittedBytes)` that cannot be
+ * returned.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "SessionJobOutputGapView".
+ */
+export interface SessionJobOutputGapView {
+  offset: number;
+  omittedBytes: number;
+  reason: SessionJobOutputGapReasonView;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -5305,7 +5399,14 @@ export interface AgentApiOutcomeOfEnvironmentListResponse {
  * via the `definition` "EnvironmentListResponse".
  */
 export interface EnvironmentListResponse {
+  /**
+   * Environments in environment id order.
+   */
   environments?: EnvironmentView[];
+  /**
+   * Pass as `after` to read the next page; absent on the last page.
+   */
+  nextAfter?: string | null;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -5407,11 +5508,16 @@ export interface EnvironmentRegistrationKeyView {
   expiresAtMs?: number | null;
   identityMode: EnvironmentIdentityModeView;
   /**
-   * First characters of the secret, for identification only.
+   * First characters of the key's live secret, for identification only.
    */
   keyPrefix: string;
   lastRegisteredAtMs?: number | null;
   maxActiveEnvironments?: number | null;
+  /**
+   * Persistent keys only: environments whose daemon has been away longer
+   * than this are closed; absent keeps them open.
+   */
+  offlineCloseAfterMs?: number | null;
   /**
    * Environments ever admitted by this key, closed included.
    */
@@ -5419,6 +5525,7 @@ export interface EnvironmentRegistrationKeyView {
   registrationKeyId: string;
   revokedAtMs?: number | null;
   status: EnvironmentRegistrationKeyStatusView;
+  updatedAtMs: number;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -5471,6 +5578,40 @@ export interface EnvironmentRegistrationKeyRevokeResponse {
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "AgentApiOutcomeOfEnvironmentRegistrationKeyRotateResponse".
+ */
+export interface AgentApiOutcomeOfEnvironmentRegistrationKeyRotateResponse {
+  notifications?: AgentNotification[];
+  result: EnvironmentRegistrationKeyRotateResponse;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentRegistrationKeyRotateResponse".
+ */
+export interface EnvironmentRegistrationKeyRotateResponse {
+  registrationKey: EnvironmentRegistrationKeyView;
+  /**
+   * The new plaintext secret, returned only here.
+   */
+  secret: EnvironmentRegistrationSecretView;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "AgentApiOutcomeOfEnvironmentRegistrationKeyUpdateResponse".
+ */
+export interface AgentApiOutcomeOfEnvironmentRegistrationKeyUpdateResponse {
+  notifications?: AgentNotification[];
+  result: EnvironmentRegistrationKeyUpdateResponse;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentRegistrationKeyUpdateResponse".
+ */
+export interface EnvironmentRegistrationKeyUpdateResponse {
+  registrationKey: EnvironmentRegistrationKeyView;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "AgentApiOutcomeOfEnvironmentTemplateListResponse".
  */
 export interface AgentApiOutcomeOfEnvironmentTemplateListResponse {
@@ -5489,16 +5630,45 @@ export interface EnvironmentTemplateListResponse {
  * via the `definition` "EnvironmentTemplateView".
  */
 export interface EnvironmentTemplateView {
-  bindingId: string;
   deprecated: boolean;
   description?: string | null;
   displayName: string;
+  /**
+   * Idle policy targets get when `environments/create` names none.
+   */
+  idle?: EnvironmentIdlePolicyView | null;
   metadata?: {
     [k: string]: string;
   };
+  /**
+   * Power states `environments/power/put` can move targets of this
+   * template to; empty without power control.
+   */
+  powerStates: EnvironmentPowerStateView[];
   providerId: string;
+  /**
+   * `environments/ingress/put` can enable public ingress on targets of
+   * this template.
+   */
   publicIngress: boolean;
+  /**
+   * Compute targets of this template get; absent when the provider does
+   * not fix it.
+   */
+  resources?: EnvironmentTemplateResourcesView | null;
   templateId: string;
+}
+/**
+ * A template's compute, in provider-neutral units. Each field is absent
+ * when the provider does not fix it.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentTemplateResourcesView".
+ */
+export interface EnvironmentTemplateResourcesView {
+  diskBytes?: number | null;
+  memoryBytes?: number | null;
+  vcpus?: number | null;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -5514,6 +5684,21 @@ export interface AgentApiOutcomeOfEnvironmentTemplateReadResponse {
  */
 export interface EnvironmentTemplateReadResponse {
   template: EnvironmentTemplateView;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "AgentApiOutcomeOfEnvironmentUpdateResponse".
+ */
+export interface AgentApiOutcomeOfEnvironmentUpdateResponse {
+  notifications?: AgentNotification[];
+  result: EnvironmentUpdateResponse;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentUpdateResponse".
+ */
+export interface EnvironmentUpdateResponse {
+  environment: EnvironmentView;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -5603,8 +5788,9 @@ export interface ServerInfo {
 export interface EnvironmentDaemonInfo {
   gitSha: string;
   /**
-   * Environment protocol version the gateway speaks. A daemon registers
-   * only when it reports exactly this number.
+   * The envd protocol version (data plane and registration channel)
+   * the gateway speaks. A daemon registers only when it reports exactly
+   * this number.
    */
   protocolVersion: number;
   /**
@@ -7389,32 +7575,6 @@ export interface DeploymentDeletedSessionsListParams {
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "DeploymentEnvironmentAdoptParams".
- */
-export interface DeploymentEnvironmentAdoptParams {
-  bindingId: string;
-  displayName?: string | null;
-  metadata?: {
-    [k: string]: string;
-  };
-  /**
-   * Stable caller-generated retry identity inside the destination universe.
-   */
-  requestId: string;
-  /**
-   * Provider-native source reference. The Incus provider accepts
-   * `<project>/<instance>` or an instance name in the `default` project.
-   */
-  sourceTarget: string;
-  /**
-   * Required acknowledgement that Lightspeed will move, reconfigure, and
-   * delete the target as part of its ordinary managed lifecycle.
-   */
-  takeOwnership: boolean;
-  universeId: string;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "DeploymentEnvironmentProviderDeleteParams".
  */
 export interface DeploymentEnvironmentProviderDeleteParams {
@@ -7426,15 +7586,35 @@ export interface DeploymentEnvironmentProviderDeleteParams {
  */
 export interface DeploymentEnvironmentProviderListParams {}
 /**
+ * Register or replace a provider. `credential` is the optional bearer
+ * token Lightspeed presents to the provider's controller and data routes:
+ * it is sealed on receipt and never returned by any method. `Debug` output
+ * redacts it; request logging must never echo these params.
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "DeploymentEnvironmentProviderPutParams".
  */
 export interface DeploymentEnvironmentProviderPutParams {
-  controllerConnection: DeploymentEnvironmentProviderConnection;
+  /**
+   * Remove the stored credential. Excludes `credential`.
+   */
+  clearCredential?: boolean;
+  /**
+   * `ws://`, `wss://` or `unix://` URL of the provider controller.
+   */
+  controllerEndpoint: string;
+  /**
+   * A new bearer credential; omit to keep the stored one. A provider needs
+   * none. Excludes `clearCredential`.
+   */
+  credential?: string | null;
+  /**
+   * `ws://` or `wss://` base of the provider's data routes; omit to derive
+   * it from the controller endpoint. Required for a `unix://` controller,
+   * and must not be `ws://` for a `wss://` controller.
+   */
+  dataRouteBase?: string | null;
   displayName?: string | null;
-  metadata?: {
-    [k: string]: string;
-  };
   providerId: string;
 }
 /**
@@ -7449,21 +7629,21 @@ export interface DeploymentEnvironmentProviderReadParams {
  * via the `definition` "DeploymentProviderBindingDeleteParams".
  */
 export interface DeploymentProviderBindingDeleteParams {
-  bindingId: string;
+  providerId: string;
   universeId: string;
 }
 /**
+ * Create or replace a universe's binding to a deployment provider.
+ *
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "DeploymentProviderBindingPutParams".
  */
 export interface DeploymentProviderBindingPutParams {
-  bindingId: string;
-  expectedRevision?: number | null;
-  metadata?: {
-    [k: string]: string;
-  };
+  /**
+   * Admits creates, template listing and data routes for the universe.
+   */
+  enabled: boolean;
   providerId: string;
-  status: EnvironmentProviderBindingStatusView;
   universeId: string;
 }
 /**
@@ -7536,21 +7716,27 @@ export interface EnvironmentCloseParams {
  * via the `definition` "EnvironmentCreateParams".
  */
 export interface EnvironmentCreateParams {
-  bindingId: string;
   displayName?: string | null;
   /**
-   * Optional staged idle policy applied by the power reaper.
+   * Idle policy passed to the provider in place of the template's `idle`.
+   * The provider runs the idle clock; it cannot be changed after create.
    */
-  idlePolicy?: EnvironmentIdlePolicyView | null;
+  idle?: EnvironmentIdlePolicyView | null;
   metadata?: {
     [k: string]: string;
   };
   /**
+   * The provider to create the environment with; the universe needs an
+   * enabled binding to it.
+   */
+  providerId: string;
+  /**
    * Stable caller-generated retry identity, unique inside the universe.
+   * Retrying with identical inputs returns the same environment.
    */
   requestId: string;
   /**
-   * Immutable provider template-version identity.
+   * The provider template to create the environment from.
    */
   templateId: string;
 }
@@ -7583,32 +7769,28 @@ export interface EnvironmentCredentialUnbindParams {
  * via the `definition` "EnvironmentExternalCreateParams".
  */
 export interface EnvironmentExternalCreateParams {
-  /**
-   * Connection to an envd instance reachable from Lightspeed.
-   */
-  connection: EnvironmentConnectionView;
   displayName?: string | null;
+  /**
+   * `ws://`, `wss://` or `unix://` URL of an envd instance reachable from
+   * Lightspeed.
+   */
+  endpoint: string;
   metadata?: {
     [k: string]: string;
   };
-  requestId: string;
-}
-/**
- * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
- * via the `definition` "EnvironmentIdlePolicyPutParams".
- */
-export interface EnvironmentIdlePolicyPutParams {
-  environmentId: string;
   /**
-   * The complete new policy; omit to clear it.
+   * Stable caller-generated retry identity, unique inside the universe.
    */
-  idlePolicy?: EnvironmentIdlePolicyView | null;
+  requestId: string;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentIngressPutParams".
  */
 export interface EnvironmentIngressPutParams {
+  /**
+   * Ensure (`true`) or remove (`false`) the provider's public ingress.
+   */
   enabled: boolean;
   environmentId: string;
 }
@@ -7669,17 +7851,38 @@ export interface SessionJobDependencyInput {
  * via the `definition` "EnvironmentJobReadParams".
  */
 export interface EnvironmentJobReadParams {
-  afterSeq?: number | null;
-  includeArtifacts?: boolean;
+  /**
+   * Byte offset to read each job's output from: a previous entry's
+   * `outputNext`. Omitted with `tailBytes` omitted reads from the start.
+   */
+  after?: number | null;
   jobs: SessionJobHandleInput[];
-  outputBytes?: number | null;
+  /**
+   * Most output bytes per job; omit for the server's default page.
+   */
+  maxBytes?: number | null;
+  /**
+   * Read each job's last `tailBytes` of output instead; excludes `after`.
+   */
+  tailBytes?: number | null;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentListParams".
  */
 export interface EnvironmentListParams {
-  bindingId?: string | null;
+  /**
+   * Exclusive environment id cursor: a previous page's `nextAfter`.
+   */
+  after?: string | null;
+  /**
+   * Also list closed environments; they are omitted by default.
+   */
+  includeClosed?: boolean;
+  /**
+   * Most environments per page; omit for 100.
+   */
+  limit?: number | null;
   /**
    * Only environments carrying every listed metadata pair (AND
    * semantics); the same filter `session/list` accepts.
@@ -7687,12 +7890,19 @@ export interface EnvironmentListParams {
   metadata?: {
     [k: string]: string;
   };
+  /**
+   * Only provisioned environments of this provider.
+   */
   providerId?: string | null;
   /**
    * Only registered environments admitted by this registration key.
    */
   registrationKeyId?: string | null;
-  status?: EnvironmentLifecycleStatusView | null;
+  /**
+   * Only environments in this lifecycle state. `closed` lists closed
+   * environments without `includeClosed`.
+   */
+  state?: EnvironmentStateView | null;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -7701,8 +7911,8 @@ export interface EnvironmentListParams {
 export interface EnvironmentPowerPutParams {
   environmentId: string;
   /**
-   * Desired steady power state. Must be one of the provider-reported
-   * `incarnation.powerStates`.
+   * Power state to move the target to; one of its template's
+   * `powerStates`.
    */
   power: EnvironmentPowerStateView;
 }
@@ -7716,7 +7926,7 @@ export interface EnvironmentProviderBindingListParams {}
  * via the `definition` "EnvironmentProviderBindingReadParams".
  */
 export interface EnvironmentProviderBindingReadParams {
-  bindingId: string;
+  providerId: string;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -7739,11 +7949,19 @@ export interface EnvironmentRegistrationKeyCreateParams {
    */
   ephemeralDisconnectGraceMs?: number | null;
   expiresAtMs?: number | null;
+  /**
+   * Immutable once the key exists.
+   */
   identityMode: EnvironmentIdentityModeView;
   /**
    * Non-closed environments the key may have at once; omit for unlimited.
    */
   maxActiveEnvironments?: number | null;
+  /**
+   * Persistent keys only: close environments whose daemon has been away
+   * longer than this; omit to keep them open.
+   */
+  offlineCloseAfterMs?: number | null;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
@@ -7770,18 +7988,75 @@ export interface EnvironmentRegistrationKeyRevokeParams {
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentRegistrationKeyRotateParams".
+ */
+export interface EnvironmentRegistrationKeyRotateParams {
+  registrationKeyId: string;
+}
+/**
+ * The complete editable policy of a registration key; an absent field is
+ * unset. The identity mode is immutable.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentRegistrationKeyUpdateParams".
+ */
+export interface EnvironmentRegistrationKeyUpdateParams {
+  /**
+   * Group name for the environments this key admits.
+   */
+  displayName: string;
+  /**
+   * Disconnect grace for ephemeral environments; omit for the default.
+   */
+  ephemeralDisconnectGraceMs?: number | null;
+  expiresAtMs?: number | null;
+  /**
+   * Non-closed environments the key may have at once; omit for unlimited.
+   */
+  maxActiveEnvironments?: number | null;
+  /**
+   * Persistent keys only: close environments whose daemon has been away
+   * longer than this; omit to keep them open.
+   */
+  offlineCloseAfterMs?: number | null;
+  registrationKeyId: string;
+}
+/**
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentTemplateListParams".
  */
 export interface EnvironmentTemplateListParams {
-  bindingId?: string | null;
+  /**
+   * Only this provider's templates; omit for every enabled binding.
+   */
+  providerId?: string | null;
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
  * via the `definition` "EnvironmentTemplateReadParams".
  */
 export interface EnvironmentTemplateReadParams {
-  bindingId: string;
+  providerId: string;
   templateId: string;
+}
+/**
+ * Replace an environment's display name and caller metadata.
+ *
+ * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema
+ * via the `definition` "EnvironmentUpdateParams".
+ */
+export interface EnvironmentUpdateParams {
+  /**
+   * The new display name; omit to clear it.
+   */
+  displayName?: string | null;
+  environmentId: string;
+  /**
+   * The complete new caller metadata; omit or `{}` to clear it.
+   */
+  metadata?: {
+    [k: string]: string;
+  };
 }
 /**
  * This interface was referenced by `LightspeedAgentAPI`'s JSON-Schema

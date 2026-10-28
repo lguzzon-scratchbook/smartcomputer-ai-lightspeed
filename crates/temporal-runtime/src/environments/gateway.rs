@@ -1,16 +1,34 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use environment_protocol::shared::{
-    EnvironmentCapabilities, EnvironmentDataConnection, EnvironmentScope, EnvironmentTransport,
-    ProviderTargetId,
-};
+use environment_client::{ClientError, ConnectOptions, DataClient};
+use environment_protocol::{data::handshake::InitializeResponse, handshake::ImplementationInfo};
 use uuid::Uuid;
+
+/// Path prefix of the worker routes the environment gateway serves:
+/// `{prefix}/{universe}/{environment}`. Runtime-internal: only Lightspeed's
+/// own workers dial it, with the deployment token.
+pub const ROUTE_PATH_PREFIX: &str = "/environment-gateway/routes";
+
+/// Connect bound (TCP, TLS and upgrade) of a worker route. The gateway
+/// answers a registered environment's upgrade only once the reverse
+/// stream is paired, which takes up to its stream-open bound; the worker
+/// waits a little longer so that the gateway's typed refusal, not the
+/// client's own timeout, reaches the caller.
+pub const WORKER_ROUTE_CONNECT_TIMEOUT: Duration =
+    Duration::from_secs(crate::gateway::registration::STREAM_OPEN_TIMEOUT.as_secs() + 5);
+
+/// Runtime-internal header of a worker route dial that must not wake a
+/// powered-down target: environment source discovery. The gateway asks the
+/// provider for a provisioned target's current power first and refuses the
+/// dial (bodiless 412) unless the target is active and running; the
+/// recorded observation cannot decide, since providers power targets down
+/// on their own clock. Other sources have no power to keep.
+pub const NO_WAKE_HEADER: &str = "lightspeed-no-wake";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RouteKey {
     pub universe_id: Uuid,
     pub environment_id: String,
-    pub incarnation_id: String,
 }
 
 #[derive(Clone)]
@@ -57,43 +75,67 @@ impl EnvironmentGatewayClientConfig {
         RouteKey {
             universe_id,
             environment_id: environment.environment_id.to_string(),
-            incarnation_id: environment.incarnation.incarnation_id.to_string(),
         }
     }
 
-    pub fn connection(&self, key: &RouteKey) -> EnvironmentDataConnection {
-        let base = websocket_base(&self.base_url);
-        EnvironmentDataConnection {
-            target_id: ProviderTargetId::new(key.environment_id.clone()),
-            endpoint: format!(
-                "{base}/environment-gateway/routes/{}/{}/{}",
-                key.universe_id, key.environment_id, key.incarnation_id
-            ),
-            transport: EnvironmentTransport::WebSocket,
-            scope: EnvironmentScope::Default,
-            default_cwd: None,
-            capabilities: EnvironmentCapabilities::default(),
-        }
+    /// The worker route of one environment: a data-plane endpoint whatever
+    /// the environment's source. Instead of upgrading, the gateway may
+    /// answer a typed `DataRouteRefusal`.
+    pub fn endpoint(&self, key: &RouteKey) -> String {
+        format!(
+            "{}{ROUTE_PATH_PREFIX}/{}/{}",
+            websocket_base(&self.base_url),
+            key.universe_id,
+            environment_protocol::routes::encode_path_segment(&key.environment_id),
+        )
     }
 
-    pub fn connection_for(
+    pub fn endpoint_for(
         &self,
         universe_id: Uuid,
         environment: &environments::EnvironmentRecord,
-    ) -> EnvironmentDataConnection {
-        self.connection(&self.route_key(universe_id, environment))
+    ) -> String {
+        self.endpoint(&self.route_key(universe_id, environment))
     }
 
-    pub fn connect_options(
-        &self,
-        user_agent: impl Into<String>,
-    ) -> environment_client::WebSocketConnectOptions {
-        environment_client::WebSocketConnectOptions {
-            bearer_token: Some((*self.deployment_token).clone()),
-            user_agent: Some(user_agent.into()),
-            headers: Vec::new(),
-        }
+    /// Data-plane connect options for a worker route: `clientInfo` names
+    /// the runtime build, `user_agent` the caller, and the deployment token
+    /// is the bearer, and the connect bound is
+    /// [`WORKER_ROUTE_CONNECT_TIMEOUT`]. Callers on background paths add a
+    /// request timeout.
+    pub fn connect_options(&self, user_agent: impl Into<String>) -> ConnectOptions {
+        let mut options = ConnectOptions::new(runtime_client_info())
+            .with_bearer_token((*self.deployment_token).clone())
+            .with_user_agent(user_agent);
+        options.connect_timeout = WORKER_ROUTE_CONNECT_TIMEOUT;
+        options
     }
+
+    /// [`connect_options`](Self::connect_options) for a dial that must not
+    /// wake its target ([`NO_WAKE_HEADER`]).
+    pub fn no_wake_connect_options(&self, user_agent: impl Into<String>) -> ConnectOptions {
+        self.connect_options(user_agent)
+            .with_header(NO_WAKE_HEADER, "1")
+    }
+
+    /// Dial the worker route of `key` and complete the data-plane
+    /// handshake.
+    pub async fn connect(
+        &self,
+        key: &RouteKey,
+        options: ConnectOptions,
+    ) -> Result<(DataClient, InitializeResponse), ClientError> {
+        DataClient::connect_initialized(&self.endpoint(key), options).await
+    }
+}
+
+/// `clientInfo` of every data and controller connection this runtime
+/// opens.
+pub fn runtime_client_info() -> ImplementationInfo {
+    ImplementationInfo::new("lightspeed-runtime")
+        .and_then(|info| info.with_version(release_info::VERSION))
+        .and_then(|info| info.with_git_sha(release_info::GIT_SHA))
+        .expect("the runtime's build facts are valid implementation info")
 }
 
 pub fn bearer_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
@@ -111,7 +153,7 @@ pub fn close_message(reason: &'static str) -> axum::extract::ws::Message {
     }))
 }
 
-pub(crate) fn websocket_base(url: &str) -> String {
+fn websocket_base(url: &str) -> String {
     if let Some(rest) = url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -140,18 +182,47 @@ mod tests {
         RouteKey {
             universe_id: Uuid::nil(),
             environment_id: "environment-a".to_owned(),
-            incarnation_id: "incarnation-a".to_owned(),
         }
     }
 
     #[test]
-    fn gateway_connection_is_stable_and_has_no_cached_capabilities() {
-        let config = EnvironmentGatewayClientConfig::new("https://gateway.test", "secret");
-        let connection = config.connection(&key());
+    fn worker_routes_are_stable_websocket_urls() {
+        let config = EnvironmentGatewayClientConfig::new("https://gateway.test/", "secret");
         assert_eq!(
-            connection.endpoint,
-            "wss://gateway.test/environment-gateway/routes/00000000-0000-0000-0000-000000000000/environment-a/incarnation-a"
+            config.endpoint(&key()),
+            "wss://gateway.test/environment-gateway/routes/00000000-0000-0000-0000-000000000000/environment-a"
         );
-        assert_eq!(connection.capabilities, EnvironmentCapabilities::default());
+        let local = EnvironmentGatewayClientConfig::new("http://127.0.0.1:18080", "secret");
+        assert!(
+            local
+                .endpoint(&key())
+                .starts_with("ws://127.0.0.1:18080/environment-gateway/routes/")
+        );
+    }
+
+    #[test]
+    fn connect_options_carry_the_deployment_token_and_runtime_build() {
+        let config = EnvironmentGatewayClientConfig::new("https://gateway.test", "secret");
+        let options = config.connect_options("lightspeed-test");
+        assert_eq!(
+            options.bearer_token.as_ref().map(|token| token.expose()),
+            Some("secret")
+        );
+        assert_eq!(options.user_agent.as_deref(), Some("lightspeed-test"));
+        assert_eq!(options.client_info.name(), "lightspeed-runtime");
+        assert_eq!(options.client_info.version(), Some(release_info::VERSION));
+        assert_eq!(options.connect_timeout, WORKER_ROUTE_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn bearer_tokens_compare_exactly() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer secret".parse().unwrap(),
+        );
+        assert!(bearer_matches(&headers, "secret"));
+        assert!(!bearer_matches(&headers, "secre"));
+        assert!(!bearer_matches(&axum::http::HeaderMap::new(), "secret"));
     }
 }

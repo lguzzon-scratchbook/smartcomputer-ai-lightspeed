@@ -1,0 +1,27 @@
+{
+  "params": {
+    "target": {
+      "owner": {
+        "universeId": "u1",
+        "environmentId": "env_1"
+      }
+    }
+  },
+  "response": {
+    "target": {
+      "owner": {
+        "universeId": "u1",
+        "environmentId": "env_1"
+      },
+      "phase": "closed"
+    }
+  },
+  "error": {
+    "code": -32019,
+    "message": "the Incus API is unreachable",
+    "data": {
+      "kind": "unavailable",
+      "retryAfterMs": 5000
+    }
+  }
+}

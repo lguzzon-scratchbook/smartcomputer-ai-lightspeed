@@ -60,6 +60,7 @@ export default defineConfig({
         { label: 'Environments', collapsed: true, items: [
           { slug: 'environments/overview' },
           { slug: 'environments/bring-your-own-compute' },
+          { slug: 'environments/registered-daemons' },
           { slug: 'environments/incus-vms' },
           { slug: 'environments/using-environments' },
           { slug: 'environments/processes-and-jobs' },
@@ -108,6 +109,7 @@ export default defineConfig({
         { label: 'Reference', collapsed: true, items: [
           { label: 'JSON-RPC API', slug: 'reference/api' },
           { label: 'Environment variables', slug: 'reference/environment-variables' },
+          { label: 'Environment protocol', slug: 'reference/environment-protocol' },
           { label: 'Workflow contract', slug: 'reference/workflow-contract' },
         ] },
       ],

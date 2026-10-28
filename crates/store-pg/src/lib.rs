@@ -368,6 +368,11 @@ pub use deployment::{
     list_universe_object_keys, list_universe_session_ids, list_universe_stats, put_universe_slug,
     read_universe_stats,
 };
+pub use environment::{
+    list_revoked_environment_routes, list_universes_with_environment_work,
+    list_universes_with_open_provisioned_environments, list_universes_with_registered_environments,
+    repair_registered_connections,
+};
 pub use environment_registration::{
     find_registered_environment_universe, find_registration_key_universe,
 };
@@ -383,40 +388,6 @@ pub async fn list_universes(pool: &PgPool) -> Result<Vec<(Uuid, Option<String>)>
             .fetch_all(pool)
             .await?;
     Ok(rows)
-}
-
-/// Universes with lifecycle intents requiring provider reconciliation.
-pub async fn list_universes_with_pending_environments(
-    pool: &PgPool,
-) -> Result<Vec<Uuid>, PgStoreError> {
-    // Include pending provider work and registered-environment heartbeat repair.
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT DISTINCT e.universe_id FROM environments e \
-         WHERE e.status IN ('provisioning','booting','closing','unknown') \
-            OR (e.source_kind = 'registered' AND e.status NOT IN ('closing','closed')) \
-            OR (e.source_kind = 'provisioned' AND ( \
-                (e.status = 'ready' AND e.desired_power <> 'running') \
-                OR (e.status = 'paused' AND e.desired_power <> 'paused') \
-                OR (e.status = 'suspended' AND e.desired_power <> 'suspended') \
-                OR (e.status = 'offline' AND e.desired_power <> 'stopped'))) \
-         ORDER BY e.universe_id",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(universe_id,)| universe_id).collect())
-}
-
-/// Universes holding a ready provisioned environment with an idle policy:
-/// the power reaper's scan set.
-pub async fn list_universes_with_idle_policies(pool: &PgPool) -> Result<Vec<Uuid>, PgStoreError> {
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT DISTINCT e.universe_id FROM environments e \
-         WHERE e.status = 'ready' AND e.idle_policy_json IS NOT NULL \
-         ORDER BY e.universe_id",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(universe_id,)| universe_id).collect())
 }
 
 /// Deployment-level check whether a universe exists. Runs above the

@@ -18,13 +18,11 @@ use api::{
     AgentApiError, AgentApiOutcome, DeploymentApiKeyCreateParams, DeploymentApiKeyCreateResponse,
     DeploymentApiKeyListParams, DeploymentApiKeyListResponse, DeploymentApiKeyRevokeParams,
     DeploymentApiKeyRevokeResponse, DeploymentApiKeyRotateParams, DeploymentApiKeyView,
-    DeploymentApiService, DeploymentEnvironmentAdoptParams, DeploymentEnvironmentAdoptResponse,
-    DeploymentEnvironmentProviderConnection, DeploymentEnvironmentProviderDeleteParams,
+    DeploymentApiService, DeploymentEnvironmentProviderDeleteParams,
     DeploymentEnvironmentProviderDeleteResponse, DeploymentEnvironmentProviderListParams,
     DeploymentEnvironmentProviderListResponse, DeploymentEnvironmentProviderPutParams,
     DeploymentEnvironmentProviderPutResponse, DeploymentEnvironmentProviderReadParams,
-    DeploymentEnvironmentProviderReadResponse, DeploymentEnvironmentProviderTransport,
-    DeploymentEnvironmentProviderView, DeploymentProviderBindingDeleteParams,
+    DeploymentEnvironmentProviderReadResponse, DeploymentProviderBindingDeleteParams,
     DeploymentProviderBindingDeleteResponse, DeploymentProviderBindingPutParams,
     DeploymentProviderBindingPutResponse, DeploymentUniverseCreateParams,
     DeploymentUniverseCreateResponse, DeploymentUniverseDeleteParams,
@@ -32,13 +30,12 @@ use api::{
     DeploymentUniverseReadParams, DeploymentUniverseReadResponse, DeploymentUniverseView,
 };
 use async_trait::async_trait;
-use environment_protocol::shared::EnvironmentTransport;
+use auth::SecretValue;
+use environment_protocol::routes::DataRouteBase;
 use environments::{
-    AdoptEnvironment, EnvironmentConnectionSpec, EnvironmentId, EnvironmentIncarnationId,
-    EnvironmentProviderBindingId, EnvironmentProviderBindingStatus,
-    EnvironmentProviderBindingStore, EnvironmentProviderId, EnvironmentProviderRecord,
-    EnvironmentProviderStore, EnvironmentProvisionRequestId, EnvironmentStore,
-    ListEnvironmentProviders, PutEnvironmentProvider, PutEnvironmentProviderBinding,
+    EnvironmentEndpoint, EnvironmentProviderBindingStore, EnvironmentProviderId,
+    EnvironmentProviderStore, EnvironmentRegistryError, ProviderCredentialChange,
+    PutEnvironmentProvider, PutEnvironmentProviderBinding,
 };
 use harness::SessionId;
 use object_store::ObjectStoreExt as _;
@@ -47,7 +44,13 @@ use temporal_workflow::{AgentSessionWorkflow, compose_workflow_id};
 use temporalio_client::{Client, WorkflowTerminateOptions, errors::WorkflowInteractionError};
 use uuid::Uuid;
 
-use crate::universe::UniverseRuntime;
+use crate::{
+    environments::{
+        provider_controllers::{WebSocketProviderControllerConnector, probe_controller},
+        providers::environment_provider_view,
+    },
+    universe::UniverseRuntime,
+};
 
 pub struct GatewayDeploymentApi {
     runtime: Arc<UniverseRuntime>,
@@ -262,22 +265,80 @@ impl DeploymentApiService for GatewayDeploymentApi {
     ) -> Result<AgentApiOutcome<DeploymentEnvironmentProviderPutResponse>, AgentApiError> {
         self.admitted(api::METHOD_DEPLOYMENT_ENVIRONMENT_PROVIDERS_PUT, async {
             let store = self.runtime.stores().store_for(Uuid::nil());
+            let provider_id = parse_environment_provider_id(params.provider_id)?;
+            let controller_endpoint = EnvironmentEndpoint::parse(&params.controller_endpoint)
+                .map_err(|error| {
+                    AgentApiError::invalid_request(format!("invalid controller endpoint: {error}"))
+                })?;
+            let data_route_base = params
+                .data_route_base
+                .map(DataRouteBase::new)
+                .transpose()
+                .map_err(|error| {
+                    AgentApiError::invalid_request(format!("invalid data route base: {error}"))
+                })?;
+            let credential = match (params.credential, params.clear_credential) {
+                (Some(_), true) => {
+                    return Err(AgentApiError::invalid_request(
+                        "credential and clearCredential are mutually exclusive",
+                    ));
+                }
+                (Some(credential), false) => {
+                    let credential = SecretValue::new(credential);
+                    environments::validate_provider_credential(&credential)
+                        .map_err(super::service::environment_providers::map_environments_error)?;
+                    ProviderCredentialChange::Set(credential)
+                }
+                (None, true) => ProviderCredentialChange::Clear,
+                (None, false) => ProviderCredentialChange::Keep,
+            };
+            let request = PutEnvironmentProvider {
+                provider_id: provider_id.clone(),
+                display_name: params.display_name,
+                controller_endpoint: controller_endpoint.clone(),
+                data_route_base,
+                credential,
+                updated_at_ms: i64::try_from(current_time_ms()?)
+                    .map_err(|_| AgentApiError::internal("current timestamp exceeds i64"))?,
+            };
+            // Refuse a configuration the store would refuse (a unix://
+            // controller without a data route base, a downgrading base)
+            // before dialing anything.
+            request
+                .clone()
+                .into_record(None)
+                .map_err(super::service::environment_providers::map_environments_error)?;
+            // The handshake presents the credential the provider will hold.
+            let presented = match &request.credential {
+                ProviderCredentialChange::Set(credential) => Some(credential.clone()),
+                ProviderCredentialChange::Clear => None,
+                ProviderCredentialChange::Keep => {
+                    match store.read_provider_credential(&provider_id).await {
+                        Ok(stored) => stored,
+                        Err(EnvironmentRegistryError::NotFound { .. }) => None,
+                        Err(error) => {
+                            return Err(
+                                super::service::environment_providers::map_environments_error(
+                                    error,
+                                ),
+                            );
+                        }
+                    }
+                }
+            };
+            probe_controller(
+                &WebSocketProviderControllerConnector,
+                &controller_endpoint,
+                presented.as_ref(),
+            )
+            .await?;
             let provider = store
-                .put_provider(PutEnvironmentProvider {
-                    provider_id: parse_environment_provider_id(params.provider_id)?,
-                    display_name: params.display_name,
-                    controller_connection: provider_connection_from_api(
-                        params.controller_connection,
-                    ),
-                    metadata: params.metadata,
-                    updated_at_ms: i64::try_from(current_time_ms()?)
-                        .map_err(|_| AgentApiError::internal("current timestamp exceeds i64"))?,
-                })
+                .put_provider(request)
                 .await
                 .map_err(super::service::environment_providers::map_environments_error)?;
             Ok(AgentApiOutcome::new(
                 DeploymentEnvironmentProviderPutResponse {
-                    provider: environment_provider_view(provider),
+                    provider: environment_provider_view(&provider),
                 },
             ))
         })
@@ -291,15 +352,12 @@ impl DeploymentApiService for GatewayDeploymentApi {
         self.admitted(api::METHOD_DEPLOYMENT_ENVIRONMENT_PROVIDERS_LIST, async {
             let store = self.runtime.stores().store_for(Uuid::nil());
             let providers = store
-                .list_providers(ListEnvironmentProviders::default())
+                .list_providers()
                 .await
                 .map_err(super::service::environment_providers::map_environments_error)?;
             Ok(AgentApiOutcome::new(
                 DeploymentEnvironmentProviderListResponse {
-                    providers: providers
-                        .into_iter()
-                        .map(environment_provider_view)
-                        .collect(),
+                    providers: providers.iter().map(environment_provider_view).collect(),
                 },
             ))
         })
@@ -319,7 +377,7 @@ impl DeploymentApiService for GatewayDeploymentApi {
                 .map_err(super::service::environment_providers::map_environments_error)?;
             Ok(AgentApiOutcome::new(
                 DeploymentEnvironmentProviderReadResponse {
-                    provider: environment_provider_view(provider),
+                    provider: environment_provider_view(&provider),
                 },
             ))
         })
@@ -339,7 +397,7 @@ impl DeploymentApiService for GatewayDeploymentApi {
                 .map_err(super::service::environment_providers::map_environments_error)?;
             Ok(AgentApiOutcome::new(
                 DeploymentEnvironmentProviderDeleteResponse {
-                    provider: environment_provider_view(provider),
+                    provider: environment_provider_view(&provider),
                 },
             ))
         })
@@ -357,26 +415,8 @@ impl DeploymentApiService for GatewayDeploymentApi {
             let binding = store
                 .put_provider_binding(PutEnvironmentProviderBinding {
                     universe_id,
-                    binding_id: EnvironmentProviderBindingId::try_new(params.binding_id).map_err(
-                        |error| {
-                            AgentApiError::invalid_request(format!("invalid binding id: {error}"))
-                        },
-                    )?,
-                    provider_id: EnvironmentProviderId::try_new(params.provider_id).map_err(
-                        |error| {
-                            AgentApiError::invalid_request(format!("invalid provider id: {error}"))
-                        },
-                    )?,
-                    status: match params.status {
-                        api::EnvironmentProviderBindingStatusView::Enabled => {
-                            EnvironmentProviderBindingStatus::Enabled
-                        }
-                        api::EnvironmentProviderBindingStatusView::Disabled => {
-                            EnvironmentProviderBindingStatus::Disabled
-                        }
-                    },
-                    metadata: params.metadata,
-                    expected_revision: params.expected_revision,
+                    provider_id: parse_environment_provider_id(params.provider_id)?,
+                    enabled: params.enabled,
                     updated_at_ms: i64::try_from(current_time_ms()?)
                         .map_err(|_| AgentApiError::internal("current timestamp exceeds i64"))?,
                 })
@@ -398,13 +438,10 @@ impl DeploymentApiService for GatewayDeploymentApi {
         self.admitted(api::METHOD_DEPLOYMENT_PROVIDER_BINDINGS_DELETE, async {
             let universe_id = parse_universe_id(&params.universe_id)?;
             self.require_universe(universe_id).await?;
-            let binding_id =
-                EnvironmentProviderBindingId::try_new(params.binding_id).map_err(|error| {
-                    AgentApiError::invalid_request(format!("invalid binding id: {error}"))
-                })?;
+            let provider_id = parse_environment_provider_id(params.provider_id)?;
             let store = self.runtime.stores().store_for(universe_id);
             let binding = store
-                .delete_provider_binding(universe_id, &binding_id)
+                .delete_provider_binding(universe_id, &provider_id)
                 .await
                 .map_err(super::service::environment_providers::map_environments_error)?;
             Ok(AgentApiOutcome::new(
@@ -417,56 +454,6 @@ impl DeploymentApiService for GatewayDeploymentApi {
             ))
         })
         .await
-    }
-
-    async fn adopt_environment(
-        &self,
-        params: DeploymentEnvironmentAdoptParams,
-    ) -> Result<AgentApiOutcome<DeploymentEnvironmentAdoptResponse>, AgentApiError> {
-        self.admitted(api::METHOD_DEPLOYMENT_ENVIRONMENTS_ADOPT, async {
-        if !params.take_ownership {
-            return Err(AgentApiError::invalid_request(
-                "takeOwnership must be true because adoption transfers lifecycle ownership to Lightspeed",
-            ));
-        }
-        let universe_id = parse_universe_id(&params.universe_id)?;
-        self.require_universe(universe_id).await?;
-        let request_id =
-            EnvironmentProvisionRequestId::try_new(params.request_id).map_err(|error| {
-                AgentApiError::invalid_request(format!("invalid environment request id: {error}"))
-            })?;
-        let binding_id =
-            EnvironmentProviderBindingId::try_new(params.binding_id).map_err(|error| {
-                AgentApiError::invalid_request(format!("invalid binding id: {error}"))
-            })?;
-        validate_adoption_source(&params.source_target)?;
-        let store = self.runtime.stores().store_for(universe_id);
-        let environment = EnvironmentStore::adopt_environment(
-            store.as_ref(),
-            AdoptEnvironment {
-                request_id,
-                environment_id: EnvironmentId::new(format!(
-                    "environment_{}",
-                    Uuid::new_v4().simple()
-                )),
-                incarnation_id: EnvironmentIncarnationId::new(format!(
-                    "incarnation_{}",
-                    Uuid::new_v4().simple()
-                )),
-                binding_id,
-                source_target: params.source_target,
-                display_name: params.display_name,
-                metadata: params.metadata,
-                created_at_ms: i64::try_from(current_time_ms()?)
-                    .map_err(|_| AgentApiError::internal("current timestamp exceeds i64"))?,
-            },
-        )
-        .await
-        .map_err(super::service::environment_providers::map_environments_error)?;
-        Ok(AgentApiOutcome::new(DeploymentEnvironmentAdoptResponse {
-            environment: super::service::environment_providers::environment_view(&environment),
-        }))
-        }).await
     }
 
     async fn put_universe_slug(
@@ -770,61 +757,9 @@ fn parse_universe_id(value: &str) -> Result<Uuid, AgentApiError> {
         .map_err(|error| AgentApiError::invalid_request(format!("invalid universe id: {error}")))
 }
 
-fn validate_adoption_source(value: &str) -> Result<(), AgentApiError> {
-    if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
-        return Err(AgentApiError::invalid_request(
-            "sourceTarget must be a non-empty provider-native reference of at most 255 bytes",
-        ));
-    }
-    Ok(())
-}
-
 fn parse_environment_provider_id(value: String) -> Result<EnvironmentProviderId, AgentApiError> {
     EnvironmentProviderId::try_new(value)
         .map_err(|error| AgentApiError::invalid_request(format!("invalid provider id: {error}")))
-}
-
-fn provider_connection_from_api(
-    connection: DeploymentEnvironmentProviderConnection,
-) -> EnvironmentConnectionSpec {
-    EnvironmentConnectionSpec {
-        endpoint: connection.endpoint,
-        transport: match connection.transport {
-            DeploymentEnvironmentProviderTransport::WebSocket => EnvironmentTransport::WebSocket,
-            DeploymentEnvironmentProviderTransport::Http => EnvironmentTransport::Http,
-            DeploymentEnvironmentProviderTransport::Stdio => EnvironmentTransport::Stdio,
-            DeploymentEnvironmentProviderTransport::Ssh => EnvironmentTransport::Ssh,
-            DeploymentEnvironmentProviderTransport::Provider { provider_type } => {
-                EnvironmentTransport::Provider { provider_type }
-            }
-        },
-    }
-}
-
-fn environment_provider_view(
-    record: EnvironmentProviderRecord,
-) -> DeploymentEnvironmentProviderView {
-    DeploymentEnvironmentProviderView {
-        provider_id: record.provider_id.to_string(),
-        display_name: record.display_name,
-        controller_connection: DeploymentEnvironmentProviderConnection {
-            endpoint: record.controller_connection.endpoint,
-            transport: match record.controller_connection.transport {
-                EnvironmentTransport::WebSocket => {
-                    DeploymentEnvironmentProviderTransport::WebSocket
-                }
-                EnvironmentTransport::Http => DeploymentEnvironmentProviderTransport::Http,
-                EnvironmentTransport::Stdio => DeploymentEnvironmentProviderTransport::Stdio,
-                EnvironmentTransport::Ssh => DeploymentEnvironmentProviderTransport::Ssh,
-                EnvironmentTransport::Provider { provider_type } => {
-                    DeploymentEnvironmentProviderTransport::Provider { provider_type }
-                }
-            },
-        },
-        metadata: record.metadata,
-        created_at_ms: record.created_at_ms,
-        updated_at_ms: record.updated_at_ms,
-    }
 }
 
 fn universe_view(stats: store_pg::UniverseStats) -> DeploymentUniverseView {

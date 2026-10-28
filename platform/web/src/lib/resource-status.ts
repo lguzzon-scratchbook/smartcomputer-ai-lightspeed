@@ -1,4 +1,5 @@
 import type { Environment, McpServer, SecretGrant, SecretProvider } from "@/api";
+import { lifecycleMessage } from "@/lib/environments";
 
 export interface ResourceStatusInfo {
   label: string;
@@ -40,27 +41,33 @@ export function mcpServerStatus(server: Pick<McpServer, "status" | "authPolicy">
   }
 }
 
-export function environmentStatus(environment: Pick<Environment, "status" | "source" | "desiredPower" | "lastSeenAtMs">): ResourceStatusInfo {
-  const { status, source, desiredPower } = environment;
-  const observed = status === "ready" ? "running" : status === "offline" ? "stopped"
-    : status === "paused" || status === "suspended" ? status : null;
-  if (source.type === "provisioned" && observed && observed !== desiredPower) {
-    return {
-      label: desiredPower === "running" ? "Waking" : "Changing power",
-      tone: "pending",
-      description: `${sentenceCase(status)} → ${desiredPower}`,
-    };
-  }
-  const description = source.type === "registered"
-    ? environment.lastSeenAtMs ? `Last seen ${relativeResourceTime(environment.lastSeenAtMs)}` : "Never seen"
-    : undefined;
-  return {
-    label: status === "booting" ? "Starting" : sentenceCase(status),
-    tone: status === "ready" ? "positive" : status === "failed" ? "danger"
-      : status === "unknown" ? "warning"
-        : ["provisioning", "booting", "closing"].includes(status) ? "pending" : "neutral",
-    description,
-  };
+const ENVIRONMENT_STATUS: Record<Environment["status"], Omit<ResourceStatusInfo, "description">> = {
+  provisioning: { label: "Provisioning", tone: "pending" },
+  ready: { label: "Ready", tone: "positive" },
+  paused: { label: "Paused", tone: "neutral" },
+  suspended: { label: "Suspended", tone: "neutral" },
+  stopped: { label: "Stopped", tone: "neutral" },
+  away: { label: "Disconnected", tone: "neutral" },
+  unknown: { label: "Unknown", tone: "warning" },
+  closing: { label: "Closing", tone: "pending" },
+  closed: { label: "Closed", tone: "neutral" },
+  failed: { label: "Failed", tone: "danger" },
+};
+
+/// The derived display status, explained by the lifecycle message (why it
+/// failed, what provisioning or closing waits on, why it closed) or, for an
+/// open environment, by what its source last reported.
+export function environmentStatus(
+  environment: Pick<Environment, "status" | "state" | "stateMessage" | "closeReason" | "source">,
+): ResourceStatusInfo {
+  const { source } = environment;
+  const status = ENVIRONMENT_STATUS[environment.status] ?? { label: sentenceCase(environment.status), tone: "neutral" };
+  const description = lifecycleMessage(environment)
+    ?? (environment.state !== "open" ? undefined
+      : source.type === "registered" && !source.connected ? `Last seen ${relativeResourceTime(source.lastSeenAtMs)}`
+        : source.type === "provisioned" ? source.observed?.message ?? undefined
+          : undefined);
+  return description ? { ...status, description } : { ...status };
 }
 
 function sentenceCase(value: string) {
